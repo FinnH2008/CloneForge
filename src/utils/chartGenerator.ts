@@ -39,7 +39,7 @@ function selectAndQuantizeOnsets(
   durationSec: number,
   resolution: number
 ): SelectedEvent[] {
-  const minStrength = Math.max(0.08, (1 - config.onsetSensitivity) * 0.82);
+  const minStrength = Math.max(0.08, (1 - config.onsetSensitivity) * 0.78);
   const minSpacingSec = config.minSpacingMs / 1000;
   const maxTick = Math.max(
     resolution * 4,
@@ -48,28 +48,58 @@ function selectAndQuantizeOnsets(
   const step = getGridStepTicks(resolution, config.quantizeGrid);
   const subStep = Math.max(24, Math.floor(step / 2));
 
+  // Local 3-second window peak normalization so softer guitar verses still place steady on-beat notes
+  // instead of leaving long empty sections followed by loud bursts.
+  const localPeaks = new Float32Array(onsets.length);
+  for (let i = 0; i < onsets.length; i++) {
+    const t = onsets[i].timeSec;
+    let peak = onsets[i].strength;
+    for (let j = i - 1; j >= 0 && t - onsets[j].timeSec <= 1.8; j--) {
+      if (onsets[j].strength > peak) peak = onsets[j].strength;
+    }
+    for (let j = i + 1; j < onsets.length && onsets[j].timeSec - t <= 1.8; j++) {
+      if (onsets[j].strength > peak) peak = onsets[j].strength;
+    }
+    localPeaks[i] = Math.max(0.15, peak);
+  }
+
+  // Max consecutive sub-290ms notes before enforcing a quarter-beat breathing gap on Easy/Medium/Hard
+  const maxFastStreak =
+    config.minSpacingMs >= 220
+      ? 2 // Easy & Medium: at most 2 eighth-speed notes in a row, then a 350ms breathing beat
+      : config.minSpacingMs >= 150
+        ? 3 // Hard: at most 3 fast notes in a row before a breathing beat
+        : 99; // Expert: unrestricted runs
+
   const chosen: SelectedEvent[] = [];
   let lastTimeSec = -minSpacingSec;
   let prevTimeGapSec = 1.0;
+  let fastStreak = 0;
   let lastTick = -1;
 
   for (let i = 0; i < onsets.length; i++) {
     const onset = onsets[i];
     const dtSec = onset.timeSec - lastTimeSec;
-    if (dtSec < minSpacingSec) continue;
+    const requiredSpacingSec =
+      fastStreak >= maxFastStreak ? Math.max(minSpacingSec * 1.35, 0.36) : minSpacingSec;
+    if (dtSec < requiredSpacingSec) continue;
 
     const rawTick = timeSecToTick(onset.timeSec, bpmMarkers, resolution, offsetMs);
     let qTick = quantizeTick(rawTick, resolution, config.quantizeGrid);
     if (qTick > maxTick) continue;
 
-    // Beat-grid salience weighting + anti-dead-air boost when no note has been placed for >0.85s
+    // Blend global and local-window onset strength so verses stay active and even
+    const localNormStrength = onset.strength / localPeaks[i];
+    const effectiveStrength = onset.strength * 0.48 + localNormStrength * 0.52;
+
+    // Beat-grid salience weighting + anti-dead-air boost when no note has been placed for >0.75s
     const distToGrid = Math.abs(rawTick - qTick);
     const onBeat = qTick % resolution === 0;
     const onEighth = qTick % (resolution / 2) === 0;
-    const gapBoost = dtSec >= 0.85 && (onBeat || onEighth) ? 0.14 : 0;
-    const gridBoost = (onBeat ? 0.11 : onEighth ? 0.06 : 0) + gapBoost;
-    if (onset.strength + gridBoost < minStrength) continue;
-    if (!onEighth && distToGrid > step * 0.34 && onset.strength < minStrength + 0.14) {
+    const gapBoost = dtSec >= 0.75 && (onBeat || onEighth) ? 0.16 : 0;
+    const gridBoost = (onBeat ? 0.12 : onEighth ? 0.06 : 0) + gapBoost;
+    if (effectiveStrength + gridBoost < minStrength) continue;
+    if (!onEighth && distToGrid > step * 0.34 && effectiveStrength < minStrength + 0.14) {
       continue;
     }
 
@@ -118,6 +148,7 @@ function selectAndQuantizeOnsets(
     if (qTick <= lastTick) continue;
 
     chosen.push({tick: qTick, onset});
+    fastStreak = dtSec < 0.29 ? fastStreak + 1 : 0;
     prevTimeGapSec = dtSec;
     lastTimeSec = onset.timeSec;
     lastTick = qTick;
@@ -690,12 +721,15 @@ export function generateGhlTrack(
   let prevCol = 0; // 0, 1, 2
   let prevRow: 'W' | 'B' = 'W';
   let prevTimeSec = -10;
+  let lastRowSwitchTimeSec = -10;
   let prevWasChord = false;
   let prevWasOpen = true;
   let consecutiveChords = 0;
   let prevVoicing: GhlChordVoicing = 'none';
   let lastBarreTimeSec = -10;
   let notesSinceLastBarre = 99;
+  let lastMixedWbTimeSec = -10;
+  let notesSinceMixedWb = 99;
   let prevCentroid = 0.5;
   let prevHigh = 0.5;
   let sameFretStreak = 0;
@@ -756,6 +790,7 @@ export function generateGhlTrack(
       consecutiveChords = 0;
       prevVoicing = 'none';
       notesSinceLastBarre++;
+      notesSinceMixedWb++;
       prevCentroid = onset.centroid;
       prevHigh = onset.highEnergy;
       sameFretStreak = 0;
@@ -783,8 +818,8 @@ export function generateGhlTrack(
             : 'B';
     } else if (
       passage === 'fast_run' &&
-      Math.abs(deltaC) < 0.045 &&
-      dtMs < 165
+      Math.abs(deltaC) < 0.065 &&
+      dtMs < 190
     ) {
       // Same-pitch fast tremolo picking stays anchored on one GHL fret
       col = prevCol;
@@ -792,35 +827,39 @@ export function generateGhlTrack(
     } else {
       // Balanced tertile column mapping across the 3 GHL columns (index=0, middle=1, ring=2)
       const targetCol = onset.centroid < 0.36 ? 0 : onset.centroid > 0.64 ? 2 : 1;
-      if (passage === 'fast_run' && Math.abs(targetCol - prevCol) > 1) {
+      // Only change column if centroid shifted meaningfully (>= 0.08) so rhythm chugs can repeat comfortably
+      if (Math.abs(deltaC) < 0.08 && sameFretStreak < 3) {
+        col = prevCol;
+      } else if ((passage === 'fast_run' || dtMs < 240) && Math.abs(targetCol - prevCol) > 1) {
         col = targetCol > prevCol ? prevCol + 1 : prevCol - 1;
       } else if (targetCol !== prevCol) {
         col = targetCol;
-      } else if (Math.abs(deltaC) >= 0.055) {
+      } else if (Math.abs(deltaC) >= 0.09) {
         col = deltaC > 0 ? Math.min(2, prevCol + 1) : Math.max(0, prevCol - 1);
       }
 
       if (canUseWhite && canUseBlack) {
         const upperScore = onset.highEnergy * 0.56 + onset.centroid * 0.44;
-        const rowThreshold = 0.44 + config.rowSwitchPenalty * 0.18;
+        const rowThreshold = 0.46 + config.rowSwitchPenalty * 0.16;
         let desiredRow: 'W' | 'B' = upperScore > rowThreshold ? 'B' : 'W';
 
-        // Alternate rows across adjacent columns after staying in one row for several notes
+        // Gently visit the other row after staying in one row for a long phrase (>= 5..9 notes)
         if (
           desiredRow === prevRow &&
-          sameRowStreak >= Math.max(3, Math.round(3 + config.rowSwitchPenalty * 3)) &&
-          (Math.abs(deltaH) >= 0.05 || Math.abs(deltaC) >= 0.05)
+          sameRowStreak >= Math.max(5, Math.round(4 + config.rowSwitchPenalty * 6)) &&
+          (Math.abs(deltaH) >= 0.08 || Math.abs(deltaC) >= 0.08)
         ) {
           desiredRow = prevRow === 'W' ? 'B' : 'W';
         }
 
         if (desiredRow !== prevRow) {
           const dtSec = onset.timeSec - prevTimeSec;
-          const strongRegisterShift = Math.abs(deltaC) >= 0.09 || Math.abs(deltaH) >= 0.09;
+          const timeSinceLastRowSwitch = onset.timeSec - lastRowSwitchTimeSec;
+          // Phrase-level row stability: never ping-pong rapidly between White and Black rows!
+          const minRowHoldSec = 0.24 + config.rowSwitchPenalty * 0.95; // ~0.56s Expert, ~0.73s Hard, ~0.98s Medium, ~1.1s Easy
           if (
-            dtSec >= 0.11 + config.rowSwitchPenalty * 0.24 ||
-            (strongRegisterShift && dtSec >= 0.09) ||
-            onset.strength > 0.72
+            timeSinceLastRowSwitch >= minRowHoldSec &&
+            dtSec >= 0.18 + config.rowSwitchPenalty * 0.22
           ) {
             row = desiredRow;
           }
@@ -832,15 +871,15 @@ export function generateGhlTrack(
       // Ergonomic GHTV Two-Finger Rule:
       // Avoid jumping the SAME finger vertically between White & Black on the same column (e.g. W1 -> B1)
       // at fast/medium speeds; shift to an adjacent column (e.g. W1 -> B2 or B1 -> W2) so two fingers share the load!
-      if (!prevWasOpen && row !== prevRow && col === prevCol && dtMs < 280) {
+      if (!prevWasOpen && row !== prevRow && col === prevCol && dtMs < 320) {
         col = prevCol === 1 ? (onset.centroid >= 0.5 ? 2 : 0) : 1;
       }
 
-      // Anti-monotony guard: prevent camping on the exact same fret when melody moves
-      if (col === prevCol && row === prevRow && (sameFretStreak >= 2 || Math.abs(deltaC) >= 0.04)) {
-        if (deltaC > 0.02 && prevCol < 2) {
+      // Anti-monotony guard: only move after >= 3 identical strums or a strong melodic leap (>= 0.14)
+      if (col === prevCol && row === prevRow && (sameFretStreak >= 3 || Math.abs(deltaC) >= 0.14)) {
+        if (deltaC > 0.03 && prevCol < 2) {
           col = prevCol + 1;
-        } else if (deltaC < -0.02 && prevCol > 0) {
+        } else if (deltaC < -0.03 && prevCol > 0) {
           col = prevCol - 1;
         } else {
           col = prevCol === 1 ? (onset.centroid >= 0.5 ? 2 : 0) : 1;
@@ -848,11 +887,11 @@ export function generateGhlTrack(
       }
     }
 
+    if (row !== prevRow) {
+      lastRowSwitchTimeSec = onset.timeSec;
+    }
     sameFretStreak = col === prevCol && row === prevRow ? sameFretStreak + 1 : 0;
     sameRowStreak = row === prevRow ? sameRowStreak + 1 : 0;
-
-    const primaryFret: GhlFretId = row === 'B' ? GHL_BLACK_FRETS[col] : GHL_WHITE_FRETS[col];
-    const fretsForTick: GhlFretId[] = [primaryFret];
 
     // Metrical & dynamic accent score for GHL chords
     const onMeasureDownbeat = tick % (resolution * 4) === 0;
@@ -866,12 +905,13 @@ export function generateGhlTrack(
       (onQuarter ? 0.12 : onEighth ? 0.05 : -0.06) +
       (sustain > 0 ? 0.08 : 0);
 
-    const chordThreshold = 0.65 - config.chordProbability * 0.45;
-    // Never place a chord immediately after a Barre chord ("Barre Release Rule"), and require >= 260ms before chaining
+    const chordThreshold = 0.66 - config.chordProbability * 0.42;
+    // Never place a chord immediately after a Barre or Diagonal W+B chord, and require >= 320ms before chaining
     const canPlaceChord =
       prevVoicing !== 'barre' &&
       prevVoicing !== 'power_3' &&
-      (!prevWasChord || (dtMs >= 280 && consecutiveChords < 2 && accentScore >= chordThreshold + 0.08));
+      prevVoicing !== 'diagonal' &&
+      (!prevWasChord || (dtMs >= 340 && consecutiveChords < 2 && accentScore >= chordThreshold + 0.08));
 
     const wantChord = matchedTemplate
       ? matchedTemplate.chordVoicing !== 'none' && config.maxChordSize > 1 && canPlaceChord
@@ -884,20 +924,30 @@ export function generateGhlTrack(
     let chosenVoicing: GhlChordVoicing = 'none';
     let partnerCol = col < 2 ? col + 1 : col - 1;
 
-    // Official GHL / Clone Hero Barre Chord Gate:
-    // Stacked same-column White+Black Barre chords (W1+B1, W2+B2, W3+B3) require flattening one finger
-    // and lifting completely afterward. Reserve them strictly for well-spaced downbeats/sustains!
-    const barreEligible =
+    // Cooldown gate for ANY simultaneous White+Black chord (Diagonal or Barre) so they never feel spammy or sudden
+    const mixedWbEligible =
       canUseWhite &&
       canUseBlack &&
+      (onQuarter || sustain > 0) &&
+      onset.timeSec - lastMixedWbTimeSec >= 1.65 &&
+      notesSinceMixedWb >= 5 &&
+      dtMs >= 210 &&
+      nextDtMs >= 210;
+
+    // Official GHL / Clone Hero Barre Chord Gate:
+    // Stacked same-column White+Black Barre chords (W1+B1, W2+B2, W3+B3) are strictly reserved for rare measure downbeats
+    const barreEligible =
+      mixedWbEligible &&
       config.allowBarreChords &&
       (onMeasureDownbeat || (onHalfBar && sustain >= Math.round(resolution * 0.5))) &&
-      onset.strength >= 0.68 &&
-      accentScore >= 0.72 &&
-      onset.timeSec - lastBarreTimeSec >= 2.6 &&
-      notesSinceLastBarre >= 9 &&
-      dtMs >= 210 &&
-      nextDtMs >= 220;
+      onset.strength >= 0.72 &&
+      accentScore >= 0.75 &&
+      onset.timeSec - lastBarreTimeSec >= 3.2 &&
+      notesSinceLastBarre >= 11 &&
+      dtMs >= 240 &&
+      nextDtMs >= 250;
+
+    let fretsForTick: GhlFretId[] = [];
 
     if (wantChord) {
       if (col === 1) {
@@ -905,38 +955,23 @@ export function generateGhlTrack(
       }
 
       if (matchedTemplate && matchedTemplate.chordVoicing !== 'none') {
-        // Only replay a template's stacked barre if barre cooldown & release window are satisfied
         if (
           (matchedTemplate.chordVoicing === 'barre' || matchedTemplate.chordVoicing === 'power_3') &&
           !barreEligible
         ) {
-          chosenVoicing = config.allowDiagonalChords && canUseWhite && canUseBlack ? 'diagonal' : 'adjacent_row';
+          chosenVoicing =
+            config.allowDiagonalChords && mixedWbEligible ? 'diagonal' : 'adjacent_row';
+        } else if (matchedTemplate.chordVoicing === 'diagonal' && !config.allowDiagonalChords) {
+          chosenVoicing = 'adjacent_row';
         } else {
           chosenVoicing = matchedTemplate.chordVoicing;
         }
         partnerCol = matchedTemplate.partnerCol;
       } else if (canUseWhite && canUseBlack) {
-        const wantPower3 =
-          barreEligible &&
-          config.maxChordSize >= 3 &&
-          sustain >= resolution &&
-          accentScore >= 0.82 &&
-          nextDtMs >= 420 &&
-          notesSinceLastBarre >= 14;
-
-        if (wantPower3) {
-          chosenVoicing = 'power_3';
-        } else if (barreEligible) {
+        if (barreEligible) {
           chosenVoicing = 'barre';
-        } else if (config.allowDiagonalChords) {
-          // Alternate naturally between 2-finger Diagonal White+Black ("nebeneinander": B1+W2, W1+B2, B2+W3, W2+B3)
-          // and 2-finger Same-Row double notes (W1+W2, W2+W3, B1+B2)
-          chosenVoicing =
-            prevVoicing === 'diagonal' && dtMs < 400
-              ? 'adjacent_row'
-              : onset.highEnergy >= 0.36 || onQuarter
-                ? 'diagonal'
-                : 'adjacent_row';
+        } else if (config.allowDiagonalChords && mixedWbEligible) {
+          chosenVoicing = 'diagonal';
         } else {
           chosenVoicing = 'adjacent_row';
         }
@@ -946,32 +981,37 @@ export function generateGhlTrack(
 
       if (chosenVoicing === 'barre' && canUseWhite && canUseBlack) {
         // Rare, impactful stacked Barre in the same column (W1+B1, W2+B2, or W3+B3)
-        const barrePartner = row === 'B' ? GHL_WHITE_FRETS[col] : GHL_BLACK_FRETS[col];
-        fretsForTick.push(barrePartner);
+        fretsForTick = [GHL_WHITE_FRETS[col], GHL_BLACK_FRETS[col]];
         lastBarreTimeSec = onset.timeSec;
         notesSinceLastBarre = 0;
+        lastMixedWbTimeSec = onset.timeSec;
+        notesSinceMixedWb = 0;
       } else if (chosenVoicing === 'diagonal' && canUseWhite && canUseBlack) {
-        // Ergonomic 2-finger Split/Diagonal White+Black across adjacent columns (B1+W2, W1+B2, B2+W3, W2+B3)
-        const oppRowFrets = row === 'B' ? GHL_WHITE_FRETS : GHL_BLACK_FRETS;
-        fretsForTick.push(oppRowFrets[partnerCol]);
+        // Consistent GHTV Power-Chord Orientation:
+        // Left Finger (lower column index) is ALWAYS Black (top row: B1 or B2),
+        // Right Finger (higher column index) is ALWAYS White (bottom row: W2 or W3).
+        // NEVER invert to W1+B2 or W2+B3 so Black and White never swap between fingers!
+        const leftCol = Math.min(col, partnerCol);
+        const rightCol = Math.min(2, leftCol + 1);
+        col = leftCol;
+        row = 'B';
+        partnerCol = rightCol;
+        fretsForTick = [GHL_BLACK_FRETS[leftCol], GHL_WHITE_FRETS[rightCol]];
         notesSinceLastBarre++;
-      } else if (chosenVoicing === 'power_3' && canUseWhite && canUseBlack) {
-        const barrePartner = row === 'B' ? GHL_WHITE_FRETS[col] : GHL_BLACK_FRETS[col];
-        fretsForTick.push(barrePartner);
-        const thirdFret =
-          onset.highEnergy >= 0.55 ? GHL_BLACK_FRETS[partnerCol] : GHL_WHITE_FRETS[partnerCol];
-        if (!fretsForTick.includes(thirdFret)) {
-          fretsForTick.push(thirdFret);
-        }
-        lastBarreTimeSec = onset.timeSec;
-        notesSinceLastBarre = 0;
+        lastMixedWbTimeSec = onset.timeSec;
+        notesSinceMixedWb = 0;
       } else {
+        // Comfortable 2-finger Same-Row double chord (W1+W2, W2+W3, or B1+B2, B2+B3)
         const sameRowFrets = row === 'B' ? GHL_BLACK_FRETS : GHL_WHITE_FRETS;
-        fretsForTick.push(sameRowFrets[partnerCol]);
+        fretsForTick = [sameRowFrets[col], sameRowFrets[partnerCol]];
         notesSinceLastBarre++;
+        notesSinceMixedWb++;
       }
     } else {
+      const primaryFret: GhlFretId = row === 'B' ? GHL_BLACK_FRETS[col] : GHL_WHITE_FRETS[col];
+      fretsForTick = [primaryFret];
       notesSinceLastBarre++;
+      notesSinceMixedWb++;
     }
 
     const isChord = fretsForTick.length > 1;

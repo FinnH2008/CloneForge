@@ -682,8 +682,9 @@ test('GHL fret generator distributes notes across all 3 columns and avoids W2 mo
   }
 
   let barreChordCount = 0; // Same-column stacked White+Black (W1+B1, W2+B2, W3+B3)
-  let diagonalWbChordCount = 0; // 2-finger cross-column White+Black (e.g., W1+B2, B1+W2, W2+B3, B2+W3)
-  let sameRowChordCount = 0; // 2-finger same-row double notes (e.g., W1+W2, B1+B2)
+  let diagonalWbChordCount = 0; // 2-finger cross-column White+Black (B1+W2, B2+W3)
+  let invertedDiagonalCount = 0; // Forbidden inverted W-left + B-right (W1+B2, W2+B3, W1+B3)
+  let sameRowChordCount = 0; // 2-finger same-row double notes (W1+W2, B1+B2)
 
   for (const frets of byTick.values()) {
     if (frets.length < 2) continue;
@@ -697,23 +698,36 @@ test('GHL fret generator distributes notes across all 3 columns and avoids W2 mo
       barreChordCount++;
     } else if (hasWhite && hasBlack) {
       diagonalWbChordCount++;
+      if (
+        (frets.includes('W1') && (frets.includes('B2') || frets.includes('B3'))) ||
+        (frets.includes('W2') && frets.includes('B3'))
+      ) {
+        invertedDiagonalCount++;
+      }
     } else {
       sameRowChordCount++;
     }
   }
 
-  // Stacked same-column Barre chords must stay rare & well-spaced (<= 8% of note ticks)
-  assert.ok(
-    barreChordCount <= Math.ceil(byTick.size * 0.08),
-    `Stacked same-column Barre chords must be strictly capped (<= 8% of ticks), got ${barreChordCount}/${byTick.size}`
+  // Never invert diagonal White+Black chords (left finger is ALWAYS Black, right finger is ALWAYS White)
+  assert.equal(
+    invertedDiagonalCount,
+    0,
+    `Diagonal White+Black chords must never swap Black/White orientation (expected 0 W1+B2 / W2+B3, got ${invertedDiagonalCount})`
   );
-  // Ergonomic 2-finger chords (diagonal W+B + same-row double notes) must outnumber stacked Barre chords
+
+  // Stacked same-column Barre chords must stay rare & well-spaced (<= 6% of note ticks)
   assert.ok(
-    diagonalWbChordCount + sameRowChordCount > barreChordCount && diagonalWbChordCount >= 2,
+    barreChordCount <= Math.ceil(byTick.size * 0.06),
+    `Stacked same-column Barre chords must be strictly capped (<= 6% of ticks), got ${barreChordCount}/${byTick.size}`
+  );
+  // Ergonomic 2-finger chords (diagonal B1+W2 / B2+W3 + same-row double notes) must outnumber stacked Barre chords
+  assert.ok(
+    diagonalWbChordCount + sameRowChordCount > barreChordCount && diagonalWbChordCount >= 1,
     `Expected ergonomic 2-finger chords (${diagonalWbChordCount} diagonal + ${sameRowChordCount} same-row) to outnumber stacked Barre chords (${barreChordCount})`
   );
 
-  // Easy & Medium GHL tracks must have 0 stacked same-column Barre chords
+  // Easy & Medium GHL tracks must have 0 mixed White+Black chords (neither Barre nor Diagonal)
   const ghlMedium = generateGhlTrack(
     analysis.onsets,
     configs.ghl.Medium,
@@ -728,13 +742,10 @@ test('GHL fret generator distributes notes across all 3 columns and avoids W2 mo
     arr.push(n.fret);
     mediumByTick.set(n.tick, arr);
   }
-  const mediumBarreCount = [...mediumByTick.values()].filter(
-    (frets) =>
-      (frets.includes('W1') && frets.includes('B1')) ||
-      (frets.includes('W2') && frets.includes('B2')) ||
-      (frets.includes('W3') && frets.includes('B3'))
+  const mediumMixedWbCount = [...mediumByTick.values()].filter(
+    (frets) => frets.some((f) => f.startsWith('W')) && frets.some((f) => f.startsWith('B'))
   ).length;
-  assert.equal(mediumBarreCount, 0, 'Medium GHL must not force single-finger stacked Barre chords');
+  assert.equal(mediumMixedWbCount, 0, 'Medium GHL must only use comfortable same-row chords, never mixed W+B chords');
 });
 
 test('Audio-ID fingerprint, binary ID3v2 tag extractor, and messy filename parser work reliably', () => {
