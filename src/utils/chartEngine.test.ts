@@ -681,39 +681,60 @@ test('GHL fret generator distributes notes across all 3 columns and avoids W2 mo
     byTick.set(n.tick, arr);
   }
 
-  let barreChordCount = 0; // Same-column White+Black next to each other (W1+B1, W2+B2, W3+B3)
-  let diagonalWbChordCount = 0; // Cross-column White+Black (e.g., W1+B2, B1+W2, W2+B3, B2+W3)
-  let anyWbSimultaneousCount = 0;
+  let barreChordCount = 0; // Same-column stacked White+Black (W1+B1, W2+B2, W3+B3)
+  let diagonalWbChordCount = 0; // 2-finger cross-column White+Black (e.g., W1+B2, B1+W2, W2+B3, B2+W3)
+  let sameRowChordCount = 0; // 2-finger same-row double notes (e.g., W1+W2, B1+B2)
 
   for (const frets of byTick.values()) {
+    if (frets.length < 2) continue;
     const hasWhite = frets.some((f) => f.startsWith('W'));
     const hasBlack = frets.some((f) => f.startsWith('B'));
-    if (hasWhite && hasBlack) {
-      anyWbSimultaneousCount++;
-      const hasBarrePair =
-        (frets.includes('W1') && frets.includes('B1')) ||
-        (frets.includes('W2') && frets.includes('B2')) ||
-        (frets.includes('W3') && frets.includes('B3'));
-      if (hasBarrePair) {
-        barreChordCount++;
-      } else {
-        diagonalWbChordCount++;
-      }
+    const hasBarrePair =
+      (frets.includes('W1') && frets.includes('B1')) ||
+      (frets.includes('W2') && frets.includes('B2')) ||
+      (frets.includes('W3') && frets.includes('B3'));
+    if (hasBarrePair) {
+      barreChordCount++;
+    } else if (hasWhite && hasBlack) {
+      diagonalWbChordCount++;
+    } else {
+      sameRowChordCount++;
     }
   }
 
+  // Stacked same-column Barre chords must stay rare & well-spaced (<= 8% of note ticks)
   assert.ok(
-    barreChordCount >= 4,
-    `Expected >= 4 same-column White+Black Barre chords (W1+B1 / W2+B2 / W3+B3), got ${barreChordCount}`
+    barreChordCount <= Math.ceil(byTick.size * 0.08),
+    `Stacked same-column Barre chords must be strictly capped (<= 8% of ticks), got ${barreChordCount}/${byTick.size}`
   );
+  // Ergonomic 2-finger chords (diagonal W+B + same-row double notes) must outnumber stacked Barre chords
   assert.ok(
-    diagonalWbChordCount >= 2,
-    `Expected >= 2 cross-column Diagonal White+Black chords (e.g., W1+B2 / B2+W3), got ${diagonalWbChordCount}`
+    diagonalWbChordCount + sameRowChordCount > barreChordCount && diagonalWbChordCount >= 2,
+    `Expected ergonomic 2-finger chords (${diagonalWbChordCount} diagonal + ${sameRowChordCount} same-row) to outnumber stacked Barre chords (${barreChordCount})`
   );
-  assert.ok(
-    anyWbSimultaneousCount >= Math.floor(byTick.size * 0.14),
-    `Expected >= 14% of note ticks to feature simultaneous White+Black frets, got ${anyWbSimultaneousCount}/${byTick.size}`
+
+  // Easy & Medium GHL tracks must have 0 stacked same-column Barre chords
+  const ghlMedium = generateGhlTrack(
+    analysis.onsets,
+    configs.ghl.Medium,
+    analysis.bpmMarkers ?? [{tick: 0, bpm: analysis.bpm}],
+    analysis.offsetMs,
+    analysis.durationSec,
+    DEFAULT_RESOLUTION
   );
+  const mediumByTick = new Map<number, string[]>();
+  for (const n of ghlMedium.notes) {
+    const arr = mediumByTick.get(n.tick) || [];
+    arr.push(n.fret);
+    mediumByTick.set(n.tick, arr);
+  }
+  const mediumBarreCount = [...mediumByTick.values()].filter(
+    (frets) =>
+      (frets.includes('W1') && frets.includes('B1')) ||
+      (frets.includes('W2') && frets.includes('B2')) ||
+      (frets.includes('W3') && frets.includes('B3'))
+  ).length;
+  assert.equal(mediumBarreCount, 0, 'Medium GHL must not force single-finger stacked Barre chords');
 });
 
 test('Audio-ID fingerprint, binary ID3v2 tag extractor, and messy filename parser work reliably', () => {

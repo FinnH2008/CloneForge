@@ -62,6 +62,44 @@ Weitere verfügbare Skripte:
 | `npm run preview` | Lokale Vorschau des Vite-Builds |
 | `npm run clean` | Entfernt Build-Ausgaben |
 
+## Hosting per Docker
+
+CloneForge Studio bringt ein mehrstufiges `Dockerfile` (`node:22-alpine`), eine `docker-compose.yml` sowie einen integrierten Healthcheck-Endpunkt (`/api/health`) für einfaches Self-Hosting (z. B. via Docker Compose, Portainer, Coolify, Unraid oder Synology NAS) mit.
+
+### Option 1: Docker Compose (empfohlen)
+
+```bash
+docker compose up -d --build
+```
+
+Die Anwendung läuft anschließend auf [http://localhost:3000](http://localhost:3000). Über eine optionale `.env`-Datei lässt sich der Host-Port anpassen (z. B. `PORT=8080`).
+
+Zum Stoppen oder Aktualisieren:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+### Option 2: Direkt per Docker CLI
+
+```bash
+docker build -t cloneforge-studio .
+docker run -d \
+  --name cloneforge-studio \
+  -p 3000:3000 \
+  --restart unless-stopped \
+  cloneforge-studio
+```
+
+### Container-Healthcheck
+
+Der integrierte Healthcheck prüft automatisch `GET http://localhost:3000/api/health` und liefert:
+
+```json
+{"status":"ok","service":"CloneForge Studio","port":3000}
+```
+
 ## Verwendung
 
 1. Eine Audio- oder Videodatei im Tab **Analyse & Tags** auswählen.

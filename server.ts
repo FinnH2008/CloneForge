@@ -2,7 +2,6 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import {fileURLToPath} from 'url';
-import {createServer as createViteServer} from 'vite';
 import {
   extractBestMusicGenre,
   pickBestLyricsResult,
@@ -733,9 +732,14 @@ async function resolveCoverArtCascade(
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({limit: '4mb'}));
+
+  // Container & Reverse-Proxy Healthcheck Endpoint
+  app.get('/api/health', (_req, res) => {
+    res.json({status: 'ok', service: 'CloneForge Studio', port: PORT});
+  });
 
   /**
    * Unified Audio-ID, Embedded Tag, MusicBrainz, Cover Art & Synced Lyrics Resolver.
@@ -991,6 +995,7 @@ async function startServer() {
   const isProd =
     process.env.NODE_ENV === 'production' && fs.existsSync(path.join(__dirname, 'dist'));
   if (!isProd) {
+    const {createServer: createViteServer} = await import('vite');
     const vite = await createViteServer({
       server: {middlewareMode: true},
       appType: 'spa',
