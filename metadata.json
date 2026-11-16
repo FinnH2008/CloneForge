@@ -1,0 +1,6 @@
+{
+  "name": "CloneForge Studio",
+  "description": "Clone Hero Chart-Generator und 6-Bund GHL Editor mit MP3/MP4-Audioanalyse, MusicBrainz-Tagging, synchronisierten Lyrics und ZIP-Export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
