@@ -1,4 +1,10 @@
-import type {AudioAnalysisResult, BpmMarker, DetectedOnset} from '../types/chart';
+import type {
+  AudioAnalysisResult,
+  BpmMarker,
+  ChartSectionMarker,
+  DetectedOnset,
+} from '../types/chart';
+import {computeAudioFingerprint} from './audioId';
 import {DEFAULT_RESOLUTION, timeSecToTick} from './timing';
 
 const FFT_SIZE = 1024;
@@ -190,8 +196,21 @@ export function analyzeAudioSamples(
       else highE += mag;
 
       if (b >= guitarMinBin && b <= guitarCentroidMaxBin) {
-        // Weight by positive transient innovation + harmonic body so guitar melody dominates over static pad
-        const weight = mag * (1 + Math.max(0, diff) * 1.8);
+        // FitzGerald (2010) lightweight 3-tap Harmonic-Percussive Separation (HPSS):
+        // Temporal stability (horizontal median across f-2, f-1, f) isolates harmonic guitar pitch
+        // while suppressing broadband vertical snare/hi-hat splashes on backbeats.
+        const t0 = curLogMag[b];
+        const t1 = histLogMag1[b];
+        const t2 = histLogMag2[b];
+        const harmonicLog = Math.max(Math.min(t0, t1), Math.min(Math.max(t0, t1), t2));
+        const v0 = curLogMag[b - 1];
+        const v1 = curLogMag[b];
+        const v2 = curLogMag[b + 1];
+        const percussiveLog = Math.max(Math.min(v0, v1), Math.min(Math.max(v0, v1), v2));
+        const harmonicRatio =
+          harmonicLog + 0.05 >= percussiveLog ? 1.25 : Math.max(0.35, harmonicLog / (percussiveLog + 0.05));
+
+        const weight = mag * harmonicRatio * (1 + Math.max(0, diff) * 1.65);
         const freqHz = b * binHz;
         const normLogF = Math.min(1, Math.max(0, (Math.log2(freqHz) - minLogFreq) / logFreqSpan));
         logPitchWeighted += normLogF * weight;
@@ -428,15 +447,88 @@ export function analyzeAudioSamples(
     }
   }
 
+  const fp = computeAudioFingerprint(samples, sampleRate);
+  const sections = buildAutomaticSections(
+    rawOnsets,
+    tempoResult.bpmMarkers,
+    tempoResult.offsetMs,
+    durationSec,
+    DEFAULT_RESOLUTION
+  );
+
   return {
     bpm: tempoResult.bpm,
     bpmMarkers: tempoResult.bpmMarkers,
     offsetMs: tempoResult.offsetMs,
     durationSec,
+    activeDurationSec: fp.activeDurationSec,
+    musicStartSec: fp.musicStartSec,
+    audioId: fp.audioId,
+    sections,
     sampleRate,
     waveformPeaks,
     onsets: rawOnsets,
   };
+}
+
+function buildAutomaticSections(
+  onsets: DetectedOnset[],
+  bpmMarkers: BpmMarker[],
+  offsetMs: number,
+  durationSec: number,
+  resolution: number
+): ChartSectionMarker[] {
+  const sections: ChartSectionMarker[] = [{tick: 0, name: 'Intro'}];
+  if (durationSec < 18 || onsets.length < 16) return sections;
+
+  const barTicks = resolution * 4;
+  const phraseTicks = barTicks * 4; // 4-bar structural blocks
+  const maxTick = timeSecToTick(durationSec - 0.5, bpmMarkers, resolution, offsetMs);
+  const numPhrases = Math.floor(maxTick / phraseTicks);
+  if (numPhrases < 2) return sections;
+
+  const phraseEnergy: number[] = [];
+  for (let p = 0; p < numPhrases; p++) {
+    const startT = p * phraseTicks;
+    const endT = startT + phraseTicks;
+    let sum = 0;
+    for (const o of onsets) {
+      const t = timeSecToTick(o.timeSec, bpmMarkers, resolution, offsetMs);
+      if (t >= startT && t < endT) {
+        sum += o.strength * (1 + o.highEnergy * 0.4);
+      }
+    }
+    phraseEnergy.push(sum);
+  }
+
+  const maxE = Math.max(0.01, ...phraseEnergy);
+  let verseIdx = 1;
+  let chorusIdx = 1;
+  let riffIdx = 1;
+  let prevLabelKind: 'intro' | 'verse' | 'chorus' | 'riff' | 'outro' = 'intro';
+
+  for (let p = 1; p < numPhrases; p++) {
+    const tick = p * phraseTicks;
+    const normE = phraseEnergy[p] / maxE;
+    if (p === numPhrases - 1 && durationSec >= 40) {
+      sections.push({tick, name: 'Outro'});
+      break;
+    }
+    let kind: 'verse' | 'chorus' | 'riff' =
+      normE >= 0.76 ? 'chorus' : normE >= 0.52 ? 'riff' : 'verse';
+    if (kind === prevLabelKind && p % 2 !== 0) continue;
+
+    if (kind === 'chorus') {
+      sections.push({tick, name: `Chorus ${chorusIdx++}`});
+    } else if (kind === 'riff') {
+      sections.push({tick, name: `Riff / Lead ${riffIdx++}`});
+    } else {
+      sections.push({tick, name: `Verse ${verseIdx++}`});
+    }
+    prevLabelKind = kind;
+  }
+
+  return sections;
 }
 
 function pickFluxPeaks(
@@ -629,9 +721,9 @@ function estimateDeepTempoAndBeatGrid(
     snareScore: (frameMid[p.frame] || 0) * 0.55 + (frameHigh[p.frame] || 0) * 0.45,
   }));
 
-  // Step 1: Full-song Multi-Window Tempogram (12s windows across the whole track, energy-weighted)
+  // Step 1: Full-song Zero-Mean Multi-Window Tempogram (68..220 BPM across 12s windows)
   const minBpm = 68;
-  const maxBpm = 185;
+  const maxBpm = 220;
   const bpmBins = Math.round((maxBpm - minBpm) / 0.5) + 1;
   const tempogramScores = new Float64Array(bpmBins);
 
@@ -642,12 +734,14 @@ function estimateDeepTempoAndBeatGrid(
   for (let w = 0; w < numWindows; w++) {
     const wStart = w * stepFrames;
     const wEnd = Math.min(n, wStart + winFrames);
+    const wLen = Math.max(1, wEnd - wStart);
     let winEnergy = 0;
     for (let i = wStart; i < wEnd; i++) {
       winEnergy += drumFlux[i];
     }
     if (winEnergy <= 0.001) continue;
-    const winWeight = winEnergy / (wEnd - wStart);
+    const winMean = winEnergy / wLen;
+    const winWeight = winMean;
 
     for (let bi = 0; bi < bpmBins; bi++) {
       const bpm = minBpm + bi * 0.5;
@@ -662,62 +756,65 @@ function estimateDeepTempoAndBeatGrid(
       let c4 = 0;
       const lim2 = wEnd - lag2;
       for (let i = wStart; i < lim2; i++) {
-        c1 += drumFlux[i] * drumFlux[i + lag1];
-        c2 += drumFlux[i] * drumFlux[i + lag2];
+        const v0 = Math.max(0, drumFlux[i] - winMean * 0.45);
+        c1 += v0 * Math.max(0, drumFlux[i + lag1] - winMean * 0.45);
+        c2 += v0 * Math.max(0, drumFlux[i + lag2] - winMean * 0.45);
       }
       if (wStart + lag4 < wEnd) {
         const lim4 = wEnd - lag4;
         for (let i = wStart; i < lim4; i++) {
-          c4 += drumFlux[i] * drumFlux[i + lag4];
+          const v0 = Math.max(0, drumFlux[i] - winMean * 0.45);
+          c4 += v0 * Math.max(0, drumFlux[i + lag4] - winMean * 0.45);
         }
       }
 
       const normLen = Math.max(1, lim2 - wStart);
-      tempogramScores[bi] += ((c1 + c2 * 0.7 + c4 * 0.45) / normLen) * winWeight;
+      tempogramScores[bi] += ((c1 + c2 * 0.72 + c4 * 0.48) / normLen) * winWeight;
     }
   }
 
-  let rawBestIdx = 0;
-  let rawBestScore = -1;
-  for (let bi = 0; bi < bpmBins; bi++) {
-    if (tempogramScores[bi] > rawBestScore) {
-      rawBestScore = tempogramScores[bi];
-      rawBestIdx = bi;
+  // Collect top 4 distinct tempogram peaks and their true binary octaves (0.5x, 1x, 2x)
+  // Never inject 2/3 or 1.5x triplet aliases (which previously turned 200 BPM into 133.3 BPM!)
+  const peakIndices: number[] = [];
+  const sortedBins = Array.from({length: bpmBins}, (_, idx) => idx).sort(
+    (a, b) => tempogramScores[b] - tempogramScores[a]
+  );
+  for (const bi of sortedBins) {
+    const b = minBpm + bi * 0.5;
+    if (peakIndices.every((pi) => Math.abs(minBpm + pi * 0.5 - b) >= 5)) {
+      peakIndices.push(bi);
+      if (peakIndices.length >= 4) break;
     }
   }
-  const coarseWinner = minBpm + rawBestIdx * 0.5;
 
+  const coarseWinner = minBpm + (peakIndices[0] ?? 0) * 0.5;
   const harmonicPool = new Set<number>();
   const addCandidate = (b: number) => {
     if (b >= minBpm && b <= maxBpm) harmonicPool.add(Number(b.toFixed(1)));
   };
-  addCandidate(coarseWinner);
-  addCandidate(coarseWinner * 2);
-  addCandidate(coarseWinner * 0.5);
-  addCandidate(coarseWinner * 1.5);
-  addCandidate((coarseWinner * 2) / 3);
 
-  let secondIdx = -1;
-  let secondScore = -1;
-  for (let bi = 0; bi < bpmBins; bi++) {
-    const b = minBpm + bi * 0.5;
-    if (Math.abs(b - coarseWinner) > 6 && tempogramScores[bi] > secondScore) {
-      secondScore = tempogramScores[bi];
-      secondIdx = bi;
-    }
-  }
-  if (secondIdx >= 0) {
-    const secB = minBpm + secondIdx * 0.5;
-    addCandidate(secB);
-    addCandidate(secB * 2);
-    addCandidate(secB * 0.5);
+  for (const pi of peakIndices) {
+    const peakBpm = minBpm + pi * 0.5;
+    addCandidate(peakBpm);
+    addCandidate(peakBpm * 2);
+    addCandidate(peakBpm * 0.5);
   }
 
-  // Step 2: Score harmonic candidates with exact phase alignment + kick(1,3)/snare(2,4) alternation
+  // Step 2: Score harmonic candidates with constant-duty-cycle phase alignment + off-grid penalty
   const evalAnchors = sampleAnchorsUniformly(anchors, 260);
+  const onsetRate = combPeaks.length / Math.max(5, durationSec);
   let bestBpm = coarseWinner;
   let bestPhaseSec = 0;
   let bestAlignScore = -Infinity;
+
+  const getMetricalPrior = (b: number): number => {
+    // Broad rock/metal/pop prior covering 78..210 BPM (including 200 BPM power metal)
+    const rangePrior = b >= 78 && b <= 208 ? 1.03 : 0.96;
+    // Slight preference for clean studio integer BPMs over .33/.67 triplet aliases
+    const intDist = Math.abs(b - Math.round(b));
+    const integerPrior = intDist <= 0.08 ? 1.022 : intDist >= 0.25 && intDist <= 0.42 ? 0.94 : 1.0;
+    return rangePrior * integerPrior;
+  };
 
   for (const baseCand of harmonicPool) {
     let localBestBpm = baseCand;
@@ -726,8 +823,7 @@ function estimateDeepTempoAndBeatGrid(
 
     for (let b = Math.max(minBpm, baseCand - 1.5); b <= Math.min(maxBpm, baseCand + 1.5); b += 0.1) {
       const res = scoreBpmAndPhase(b, evalAnchors);
-      const metricalPrior = b >= 82 && b <= 165 ? 1.04 : 0.96;
-      const total = res.score * metricalPrior;
+      const total = res.score * getMetricalPrior(b);
       if (total > localBestScore) {
         localBestScore = total;
         localBestBpm = b;
@@ -737,8 +833,7 @@ function estimateDeepTempoAndBeatGrid(
 
     for (let b = localBestBpm - 0.15; b <= localBestBpm + 0.15; b += 0.02) {
       const res = scoreBpmAndPhase(b, evalAnchors);
-      const metricalPrior = b >= 82 && b <= 165 ? 1.04 : 0.96;
-      const total = res.score * metricalPrior;
+      const total = res.score * getMetricalPrior(b);
       if (total > localBestScore) {
         localBestScore = total;
         localBestBpm = b;
@@ -753,6 +848,19 @@ function estimateDeepTempoAndBeatGrid(
     }
   }
 
+  // Octave disambiguation for fast double-time / power-metal tracks (e.g. 100 BPM vs 200 BPM):
+  // If bestBpm landed on half-time (85..112 BPM) but the track has high transient density (>= 4.2/s)
+  // and 2 * bestBpm aligns cleanly on beats, promote to the true fast tempo.
+  if (bestBpm >= 85 && bestBpm <= 112 && bestBpm * 2 <= maxBpm && onsetRate >= 4.2) {
+    const doubleCand = Math.round(bestBpm * 2 * 2) / 2;
+    const doubleRes = scoreBpmAndPhase(doubleCand, evalAnchors);
+    const singleRes = scoreBpmAndPhase(bestBpm, evalAnchors);
+    if (doubleRes.score >= singleRes.score * 0.91) {
+      bestBpm = doubleCand;
+      bestPhaseSec = doubleRes.phaseSec;
+    }
+  }
+
   // Step 3: Dan Ellis (2007) Dynamic Programming Beat Tracking + Full-Song Linear Regression
   // Refines global BPM & phase over all tracked beats so 3.5-min songs have zero cumulative drift
   const dpBeatFrames = trackBeatsEllisDP(drumFlux, combinedFlux, frameRate, bestBpm);
@@ -760,7 +868,6 @@ function estimateDeepTempoAndBeatGrid(
     const dpTimes = dpBeatFrames.map((f) => (f * hopSize) / sampleRate);
     const targetIbi = 60 / bestBpm;
 
-    // Collect clean consecutive beat intervals to verify stationary vs shifting tempo
     const cleanPairs: {beatIdx: number; timeSec: number}[] = [];
     let cumulativeIdx = 0;
     cleanPairs.push({beatIdx: 0, timeSec: dpTimes[0]});
@@ -777,7 +884,6 @@ function estimateDeepTempoAndBeatGrid(
     }
 
     if (cleanPairs.length >= 12) {
-      // Ordinary Least Squares slope across the dominant coherent beat run
       let sumX = 0;
       let sumY = 0;
       for (const p of cleanPairs) {
@@ -797,7 +903,6 @@ function estimateDeepTempoAndBeatGrid(
         const fittedIbi = num / den;
         const fittedBpm = 60 / fittedIbi;
         if (Math.abs(fittedBpm - bestBpm) <= 1.2) {
-          // Compare anchor alignment score of DP-fitted BPM vs localBestBpm
           const dpRes = scoreBpmAndPhase(fittedBpm, evalAnchors);
           const curRes = scoreBpmAndPhase(bestBpm, evalAnchors);
           if (dpRes.score >= curRes.score * 0.97) {
@@ -809,9 +914,13 @@ function estimateDeepTempoAndBeatGrid(
     }
   }
 
-  // Snap to clean .0 / .5 BPM if within 0.06 BPM so studio click-track songs stay rock-solid
+  // Snap to clean .0 / .5 BPM if within 0.12 BPM so studio click-track songs stay rock-solid
+  const nearestInt = Math.round(bestBpm);
   const nearestHalf = Math.round(bestBpm * 2) / 2;
-  if (Math.abs(bestBpm - nearestHalf) <= 0.06) {
+  if (Math.abs(bestBpm - nearestInt) <= 0.15) {
+    bestBpm = nearestInt;
+    bestPhaseSec = scoreBpmAndPhase(bestBpm, evalAnchors).phaseSec;
+  } else if (Math.abs(bestBpm - nearestHalf) <= 0.08) {
     bestBpm = nearestHalf;
     bestPhaseSec = scoreBpmAndPhase(bestBpm, evalAnchors).phaseSec;
   } else {
@@ -852,6 +961,43 @@ function estimateDeepTempoAndBeatGrid(
   return {bpm: bestBpm, bpmMarkers, offsetMs};
 }
 
+/**
+ * Recomputes the optimal 4-beat measure downbeat offset (in ms) for any target BPM
+ * so manual BPM edits or Audio-ID catalog BPM updates immediately snap the grid onto transients.
+ */
+export function recomputeOffsetMsForBpm(bpm: number, onsets: DetectedOnset[]): number {
+  if (!onsets || onsets.length === 0 || bpm <= 20) return 0;
+  const anchors: BeatAnchor[] = sampleAnchorsUniformly(
+    onsets.map((o) => ({
+      timeSec: o.timeSec,
+      strength: o.strength,
+      lowScore: o.lowEnergy,
+      snareScore: o.midEnergy * 0.55 + o.highEnergy * 0.45,
+    })),
+    260
+  );
+  const {phaseSec} = scoreBpmAndPhase(bpm, anchors);
+  const beatSec = 60 / bpm;
+  let bestBarPhase = phaseSec;
+  let bestBarScore = -Infinity;
+  for (let bOffset = 0; bOffset < 4; bOffset++) {
+    const candPhase = (phaseSec + bOffset * beatSec) % (beatSec * 4);
+    let score = 0;
+    for (const a of anchors) {
+      const barPos = (a.timeSec - candPhase) / (beatSec * 4);
+      const frac = Math.abs(barPos - Math.round(barPos));
+      if (frac < 0.045) {
+        score += a.strength * (1 + a.lowScore * 0.40);
+      }
+    }
+    if (score > bestBarScore) {
+      bestBarScore = score;
+      bestBarPhase = candPhase;
+    }
+  }
+  return Math.round(bestBarPhase * 1000);
+}
+
 function sampleAnchorsUniformly(anchors: BeatAnchor[], maxCount: number): BeatAnchor[] {
   if (anchors.length <= maxCount) return anchors;
   const out: BeatAnchor[] = [];
@@ -867,37 +1013,42 @@ function scoreBpmAndPhase(
   anchors: BeatAnchor[]
 ): {phaseSec: number; score: number} {
   const beatSec = 60 / bpm;
-  const stepSec = 0.008;
+  const stepSec = Math.max(0.005, Math.min(0.008, beatSec / 45));
+  // Constant duty-cycle tolerance in beat units (6.8% of a beat) so fast/fractional BPMs
+  // never gain an unfair window-coverage advantage over the true beat period.
+  const tolBeats = 0.068;
   let bestPhase = 0;
-  let bestScore = -1;
+  let bestScore = -Infinity;
 
   for (let phase = 0; phase < beatSec; phase += stepSec) {
     let beatHitScore = 0;
     let eighthHitScore = 0;
     let backbeatAltScore = 0;
+    let offGridPenalty = 0;
 
     for (const a of anchors) {
       const distBeats = (a.timeSec - phase) / beatSec;
       const nearestBeat = Math.round(distBeats);
       const frac = Math.abs(distBeats - nearestBeat);
-      const tolBeats = Math.min(0.09, 0.032 / beatSec); // ~32ms tolerance window
 
       if (frac <= tolBeats) {
         const w = a.strength * (1 - frac / tolBeats);
         beatHitScore += w;
-        // Kick on even beats (0,2) vs Snare on odd beats (1,3) rewards true 4/4 tempo over half/double
         const isOddBeat = Math.abs(nearestBeat) % 2 === 1;
         if (isOddBeat) backbeatAltScore += w * a.snareScore * 0.25;
-        else backbeatAltScore += w * a.lowScore * 0.2;
+        else backbeatAltScore += w * a.lowScore * 0.22;
       } else {
         const halfFrac = Math.abs(distBeats * 2 - Math.round(distBeats * 2)) * 0.5;
-        if (halfFrac <= tolBeats * 0.75) {
-          eighthHitScore += a.strength * 0.28;
+        if (halfFrac <= tolBeats * 0.78) {
+          eighthHitScore += a.strength * 0.30;
+        } else if (halfFrac > 0.14) {
+          // Penalize candidate tempos where strong transients fall in the anti-phase gap (kills 4/3 & 2/3 triplet illusions)
+          offGridPenalty += a.strength * 0.18;
         }
       }
     }
 
-    const total = beatHitScore + eighthHitScore + backbeatAltScore;
+    const total = beatHitScore + eighthHitScore + backbeatAltScore - offGridPenalty;
     if (total > bestScore) {
       bestScore = total;
       bestPhase = phase;

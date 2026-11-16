@@ -85,6 +85,7 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
   const [mbLoading, setMbLoading] = useState(false);
   const [mbError, setMbError] = useState<string | null>(null);
   const [coverLoadingId, setCoverLoadingId] = useState<string | null>(null);
+  const [fallbackCoverUrl, setFallbackCoverUrl] = useState<string | null>(null);
 
   const currentBpm = bpmMarkers[0]?.bpm ?? analysis?.bpm ?? 120;
 
@@ -113,7 +114,9 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
 
   const handleMusicBrainzSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const queryText = mbQuery.trim() || [metadata.artist, metadata.title].filter(Boolean).join(' ');
+    const cleanArtist =
+      metadata.artist && metadata.artist !== 'Unbekannter Interpret' ? metadata.artist.trim() : '';
+    const queryText = mbQuery.trim() || [cleanArtist, metadata.title].filter(Boolean).join(' ');
     if (!queryText) {
       setMbError('Bitte Titel oder Interpret für die MusicBrainz-Suche eingeben.');
       return;
@@ -125,18 +128,27 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
       const params = new URLSearchParams();
       if (!mbQuery.trim() && metadata.title) {
         params.set('title', metadata.title);
-        if (metadata.artist) params.set('artist', metadata.artist);
+        if (cleanArtist) params.set('artist', cleanArtist);
       } else {
         params.set('q', queryText);
       }
       if (analysis?.durationSec) {
         params.set('durationSec', String(Math.round(analysis.durationSec)));
       }
+      if (analysis?.activeDurationSec) {
+        params.set('activeDurationSec', String(Math.round(analysis.activeDurationSec)));
+      }
       params.set('enrich', '1');
       const res = await fetch(`/api/musicbrainz/search?${params.toString()}`);
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || 'MusicBrainz-Suche fehlgeschlagen.');
+      }
+      if (data.fallbackCoverUrl) {
+        setFallbackCoverUrl(data.fallbackCoverUrl);
+      }
+      if (data.isrc && !metadata.isrc) {
+        onUpdateMetadata({isrc: data.isrc});
       }
       onSetMbResults(Array.isArray(data.results) ? data.results : []);
       if (Array.isArray(data.results) && data.results.length === 0) {
@@ -174,11 +186,15 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
       )
     );
 
-    if (candidateIds.length > 0) {
+    if (candidateIds.length > 0 || fallbackCoverUrl) {
       setCoverLoadingId(rec.mbid);
       try {
+        let found = false;
         for (const relId of candidateIds) {
-          const res = await fetch(`/api/musicbrainz/cover/${relId}`);
+          const fbParam = fallbackCoverUrl
+            ? `?fallbackUrl=${encodeURIComponent(fallbackCoverUrl)}`
+            : '';
+          const res = await fetch(`/api/musicbrainz/cover/${relId}${fbParam}`);
           if (res.ok) {
             const data = await res.json();
             if (data.dataUrl) {
@@ -186,7 +202,22 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
                 coverDataUrl: data.dataUrl,
                 coverMime: data.mimeType || 'image/jpeg',
               });
+              found = true;
               break;
+            }
+          }
+        }
+        if (!found && fallbackCoverUrl) {
+          const res = await fetch(
+            `/api/musicbrainz/cover/fallback?fallbackUrl=${encodeURIComponent(fallbackCoverUrl)}`
+          );
+          if (res.ok) {
+            const data = await res.json();
+            if (data.dataUrl) {
+              onUpdateMetadata({
+                coverDataUrl: data.dataUrl,
+                coverMime: data.mimeType || 'image/jpeg',
+              });
             }
           }
         }
@@ -215,11 +246,17 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
 
   return (
     <div className="mx-auto max-w-[1380px] space-y-6 px-6 py-6">
-      {(autoPipeline.running || autoPipeline.mbSummary || autoPipeline.lyricsSummary) && (
+      {(hasAudio || autoPipeline.running || autoPipeline.mbSummary || autoPipeline.lyricsSummary) && (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#263145] bg-[#131924] px-5 py-3">
           <div className="flex flex-wrap items-center gap-3 text-xs text-slate-200">
             {autoPipeline.running && <Loader2 className="h-4 w-4 animate-spin text-amber-400" />}
-            <span className="font-semibold text-amber-400">Vollautomatische Erkennung:</span>
+            <span className="font-semibold text-amber-400">Audio-ID & Auto-Tagging:</span>
+            {metadata.audioId && (
+              <span className="font-mono-tabular text-slate-300">
+                ID {metadata.audioId.slice(0, 17)}
+                {metadata.isrc ? ` · ISRC ${metadata.isrc}` : ''}
+              </span>
+            )}
             {autoPipeline.mbSummary && <span>{autoPipeline.mbSummary}</span>}
             {autoPipeline.mbSummary && autoPipeline.lyricsSummary && (
               <span aria-hidden="true" className="text-slate-500">
@@ -235,7 +272,7 @@ export const AnalysisAndTagsView: React.FC<AnalysisAndTagsViewProps> = ({
               className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#334155] bg-[#1B2332] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-amber-500/60 hover:text-white"
             >
               <RefreshCw className="h-3.5 w-3.5 text-amber-400" />
-              Tags & Lyrics neu erkennen
+              Über Audio-ID & MusicBrainz neu abgleichen
             </button>
           )}
         </div>

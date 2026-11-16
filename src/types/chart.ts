@@ -101,6 +101,8 @@ export interface SongMetadata {
   coverMime: string | null;
   mbid: string | null;
   releaseMbid: string | null;
+  isrc?: string | null;
+  audioId?: string | null;
 }
 
 export interface DetectedOnset {
@@ -118,6 +120,10 @@ export interface AudioAnalysisResult {
   bpmMarkers?: BpmMarker[];
   offsetMs: number;
   durationSec: number;
+  activeDurationSec?: number;
+  musicStartSec?: number;
+  audioId?: string;
+  sections?: ChartSectionMarker[];
   sampleRate: number;
   waveformPeaks: number[]; // ~800 normalized buckets for timeline overview
   onsets: DetectedOnset[];

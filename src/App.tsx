@@ -14,6 +14,7 @@ import type {
   AudioAnalysisResult,
   BpmMarker,
   ChartTracks,
+  DetectedOnset,
   Difficulty,
   DifficultyConfig,
   DifficultyConfigMap,
@@ -29,7 +30,9 @@ import {
   analyzeAudioSamples,
   audioBufferToMono,
   generateDemoAudioSamples,
+  recomputeOffsetMsForBpm,
 } from './utils/audioDsp';
+import {extractEmbeddedMediaTags, type EmbeddedMediaTags} from './utils/audioId';
 import {
   estimateDifficultyTier,
   generateAllCharts,
@@ -42,8 +45,8 @@ import {
   serializeSongIni,
 } from './utils/chartSerializer';
 import {createDefaultDifficultyConfigs} from './utils/difficultyPresets';
-import {lrcLinesToPhrases, parseLrcString} from './utils/lyricsSync';
-import {DEFAULT_RESOLUTION, parseFilenameMetadata} from './utils/timing';
+import {lrcLinesToPhrases, parseLrcString, plainTextToTimedPhrases} from './utils/lyricsSync';
+import {DEFAULT_RESOLUTION, parseFilenameMetadata, sanitizeArtistForQuery} from './utils/timing';
 
 type ActiveTab = 'analyse' | 'editor' | 'lyrics' | 'advanced';
 
@@ -108,6 +111,7 @@ export default function App() {
     mbSummary: string | null;
     lyricsSummary: string | null;
   }>({running: false, mbSummary: null, lyricsSummary: null});
+  const [embeddedTagsRefState, setEmbeddedTagsRefState] = useState<EmbeddedMediaTags>({});
   const [metadata, setMetadata] = useState<SongMetadata>({
     title: '',
     artist: '',
@@ -123,6 +127,8 @@ export default function App() {
     coverMime: null,
     mbid: null,
     releaseMbid: null,
+    isrc: null,
+    audioId: null,
   });
 
   // Playback engine state
@@ -301,6 +307,8 @@ export default function App() {
         coverMime: meta.coverMime !== undefined ? meta.coverMime : prev.coverMime,
         mbid: meta.mbid !== undefined ? meta.mbid : prev.mbid,
         releaseMbid: meta.releaseMbid !== undefined ? meta.releaseMbid : prev.releaseMbid,
+        isrc: meta.isrc !== undefined ? meta.isrc : prev.isrc,
+        audioId: dsp.audioId ?? meta.audioId ?? prev.audioId,
         diffGuitar: diff5,
         diffGuitarGhl: diffGhl,
         previewStartMs: Math.min(Math.round(dsp.durationSec * 400), 15000),
@@ -308,160 +316,209 @@ export default function App() {
 
       if (seedLrc) {
         const parsed = parseLrcString(seedLrc);
-        setLyrics(
-          lrcLinesToPhrases(parsed, initialBpm, DEFAULT_RESOLUTION, dsp.offsetMs, dsp.durationSec)
-        );
+        if (parsed.length > 0) {
+          setLyrics(
+            lrcLinesToPhrases(parsed, initialBpm, DEFAULT_RESOLUTION, dsp.offsetMs, dsp.durationSec)
+          );
+        } else {
+          setLyrics(
+            plainTextToTimedPhrases(
+              seedLrc,
+              dsp.durationSec,
+              initialBpm,
+              DEFAULT_RESOLUTION,
+              dsp.offsetMs
+            )
+          );
+        }
       }
     },
     [configs]
   );
 
   const runAutoEnrichPipeline = useCallback(
-    async (
-      artistInput: string,
-      titleInput: string,
-      durationSec: number,
-      activeBpm: BpmMarker[],
-      activeOffsetMs: number
-    ) => {
-      if (!titleInput && !artistInput) return;
+    async (params: {
+      artistInput: string;
+      titleInput: string;
+      rawFileName?: string | null;
+      durationSec: number;
+      activeDurationSec?: number;
+      musicStartSec?: number;
+      audioId?: string;
+      embeddedTags?: EmbeddedMediaTags;
+      activeBpm: BpmMarker[];
+      activeOffsetMs: number;
+      onsets?: DetectedOnset[];
+    }) => {
+      const cleanArtist = sanitizeArtistForQuery(params.artistInput);
+      const cleanTitle = params.titleInput.trim();
+      if (!cleanTitle && !cleanArtist && !params.rawFileName && !params.embeddedTags?.isrc) return;
 
       setAutoPipeline({
         running: true,
-        mbSummary: 'MusicBrainz & Cover werden automatisch ermittelt...',
-        lyricsSummary: 'Songtexte (LRCLIB) werden automatisch gesucht...',
+        mbSummary: `Audio-ID (${params.audioId?.slice(0, 12) || 'Fingerprint'}) & MusicBrainz werden abgeglichen...`,
+        lyricsSummary: 'Synchronisierte Lyrics (LRCLIB) werden automatisch gesucht...',
       });
 
-      let resolvedTitle = titleInput;
-      let resolvedArtist = artistInput;
       let mbSummary = 'MusicBrainz: Kein eindeutiger Studio-Treffer';
+      let lyricsSummary = 'Lyrics: Keine passenden Treffer gefunden';
 
       try {
-        const mbParams = new URLSearchParams();
-        if (titleInput) mbParams.set('title', titleInput);
-        if (artistInput) mbParams.set('artist', artistInput);
-        if (!titleInput && artistInput) mbParams.set('q', artistInput);
-        if (durationSec > 0) mbParams.set('durationSec', String(Math.round(durationSec)));
-        mbParams.set('enrich', '1');
+        const res = await fetch('/api/audio-id/resolve', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            audioId: params.audioId,
+            durationSec: Math.round(params.durationSec),
+            activeDurationSec: Math.round(params.activeDurationSec || params.durationSec),
+            rawFileName: params.rawFileName || '',
+            title: cleanTitle,
+            artist: cleanArtist,
+            embeddedTags: params.embeddedTags || {},
+          }),
+        });
 
-        const mbRes = await fetch(`/api/musicbrainz/search?${mbParams.toString()}`);
-        if (mbRes.ok) {
-          const mbData = await mbRes.json();
-          const list: MusicBrainzResult[] = Array.isArray(mbData.results) ? mbData.results : [];
-          setMbResults(list);
+        if (res.ok) {
+          const data = await res.json();
+          const mbList: MusicBrainzResult[] = Array.isArray(data.mbResults) ? data.mbResults : [];
+          const lrcList: LrcLibResult[] = Array.isArray(data.lrcResults) ? data.lrcResults : [];
+          setMbResults(mbList);
+          setLrcResults(lrcList);
 
-          const best = list[0];
-          if (best) {
-            resolvedTitle = best.title || resolvedTitle;
-            resolvedArtist = best.artist || resolvedArtist;
-            const chosenRel = best.releases[0];
-            const yearMatch = (chosenRel?.date || best.year || '').match(/\d{4}/);
+          const bestMb = mbList[0];
+          const canonical = data.canonical;
+          const resolvedTitle = bestMb?.title || canonical?.title || cleanTitle;
+          const resolvedArtist = bestMb?.artist || canonical?.artist || cleanArtist;
+          const chosenRel = bestMb?.releases?.[0];
+          const resolvedAlbum = chosenRel?.title || bestMb?.album || canonical?.album || '';
+          const yearMatch = (chosenRel?.date || bestMb?.year || canonical?.year || '').match(
+            /\d{4}/
+          );
+          const resolvedGenre = bestMb?.genre || canonical?.genre || '';
+          const resolvedIsrc = data.isrc || params.embeddedTags?.isrc || null;
 
-            setMetadata((prev) => ({
-              ...prev,
-              title: best.title || prev.title,
-              artist: best.artist || prev.artist,
-              album: chosenRel?.title || best.album || prev.album,
-              year: yearMatch ? yearMatch[0] : prev.year,
-              genre: best.genre || prev.genre,
-              mbid: best.mbid,
-              releaseMbid: chosenRel?.id || best.releaseMbid || null,
-            }));
+          // Cross-check DSP BPM with official Audio-ID / Catalog Studio BPM (e.g. 200 BPM for DragonForce)
+          let effectiveBpmMarkers = params.activeBpm;
+          let effectiveOffsetMs = params.activeOffsetMs;
+          const catalogBpm = Number(data.catalogBpm || canonical?.bpm);
+          const currentBpm = params.activeBpm[0]?.bpm ?? 120;
+          const targetOnsets = params.onsets ?? analysis?.onsets ?? [];
 
-            let coverFound = false;
-            const candidateIds = Array.from(
-              new Set(
-                [
-                  chosenRel?.id,
-                  best.releaseMbid,
-                  ...best.releases.slice(0, 4).map((r) => r.id),
-                ].filter((id): id is string => Boolean(id))
-              )
-            );
-            for (const relId of candidateIds) {
-              try {
-                const covRes = await fetch(`/api/musicbrainz/cover/${relId}`);
-                if (covRes.ok) {
-                  const covData = await covRes.json();
-                  if (covData.dataUrl) {
-                    setMetadata((prev) => ({
-                      ...prev,
-                      coverDataUrl: covData.dataUrl,
-                      coverMime: covData.mimeType || 'image/jpeg',
-                    }));
-                    coverFound = true;
-                    break;
-                  }
-                }
-              } catch {
-                // continue trying next candidate release
-              }
+          if (
+            Number.isFinite(catalogBpm) &&
+            catalogBpm >= 55 &&
+            catalogBpm <= 235 &&
+            Math.abs(catalogBpm - currentBpm) >= 1.5
+          ) {
+            effectiveBpmMarkers = [{tick: 0, bpm: catalogBpm}];
+            if (targetOnsets.length > 0) {
+              effectiveOffsetMs = recomputeOffsetMsForBpm(catalogBpm, targetOnsets);
             }
+            setBpmMarkers(effectiveBpmMarkers);
+            setOffsetMs(effectiveOffsetMs);
+            setAnalysis((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    bpm: catalogBpm,
+                    bpmMarkers: effectiveBpmMarkers,
+                    offsetMs: effectiveOffsetMs,
+                  }
+                : prev
+            );
+            if (targetOnsets.length > 0) {
+              const regenerated = generateAllCharts(
+                targetOnsets,
+                configs,
+                effectiveBpmMarkers,
+                effectiveOffsetMs,
+                params.durationSec,
+                DEFAULT_RESOLUTION
+              );
+              setTracks(regenerated);
+            }
+          }
 
-            mbSummary = `MusicBrainz: ${best.artist} – ${best.title}${chosenRel?.title ? ` (${chosenRel.title})` : ''}${coverFound ? ' + Cover' : ''}`;
+          setMetadata((prev) => ({
+            ...prev,
+            title: resolvedTitle || prev.title,
+            artist: resolvedArtist || prev.artist || 'Unbekannter Interpret',
+            album: resolvedAlbum || prev.album,
+            year: yearMatch ? yearMatch[0] : prev.year,
+            genre: resolvedGenre || prev.genre,
+            mbid: bestMb?.mbid || prev.mbid,
+            releaseMbid: chosenRel?.id || bestMb?.releaseMbid || prev.releaseMbid,
+            isrc: resolvedIsrc || prev.isrc,
+            audioId: params.audioId || prev.audioId,
+            coverDataUrl: data.coverDataUrl || prev.coverDataUrl,
+            coverMime: data.coverMime || prev.coverMime,
+          }));
+
+          if (bestMb || canonical) {
+            const idBadge = resolvedIsrc ? ` [${resolvedIsrc}]` : '';
+            const bpmBadge =
+              Number.isFinite(catalogBpm) && catalogBpm >= 55 ? ` · ${catalogBpm} BPM` : '';
+            mbSummary = `${data.identificationSource || 'MusicBrainz'}: ${resolvedArtist} – ${resolvedTitle}${
+              resolvedAlbum ? ` (${resolvedAlbum})` : ''
+            }${idBadge}${bpmBadge}${data.coverDataUrl ? ' + Cover' : ''}`;
+          }
+
+          const bestLrc = pickBestLyricsResult(
+            lrcList,
+            params.durationSec,
+            resolvedTitle,
+            params.activeDurationSec,
+            resolvedArtist,
+            resolvedAlbum
+          );
+
+          if (bestLrc) {
+            if (bestLrc.syncedLyrics) {
+              let parsed = parseLrcString(bestLrc.syncedLyrics);
+              // If this is a music video with a silent/skit intro (musicStartSec >= 3s) and the studio LRC duration
+              // matches activeDurationSec closer than total durationSec, shift LRC timestamps by musicStartSec
+              const musicStart = params.musicStartSec || 0;
+              if (
+                musicStart >= 3.0 &&
+                bestLrc.duration > 0 &&
+                params.activeDurationSec &&
+                Math.abs(bestLrc.duration - params.activeDurationSec) + 2.5 <
+                  Math.abs(bestLrc.duration - params.durationSec) &&
+                parsed.length > 0 &&
+                parsed[0].timeSec < musicStart + 4
+              ) {
+                parsed = parsed.map((line) => ({
+                  ...line,
+                  timeSec: line.timeSec + musicStart,
+                }));
+              }
+
+              const phrases = lrcLinesToPhrases(
+                parsed,
+                effectiveBpmMarkers,
+                DEFAULT_RESOLUTION,
+                effectiveOffsetMs,
+                params.durationSec || 180
+              );
+              setLyrics(phrases);
+              lyricsSummary = `Lyrics: ${phrases.length} synchronisierte Zeilen automatisch geladen`;
+            } else if (bestLrc.plainLyrics) {
+              const phrases = plainTextToTimedPhrases(
+                bestLrc.plainLyrics,
+                params.durationSec || 180,
+                effectiveBpmMarkers,
+                DEFAULT_RESOLUTION,
+                effectiveOffsetMs
+              );
+              setLyrics(phrases);
+              lyricsSummary = `Lyrics: ${phrases.length} Textzeilen automatisch auf Song verteilt`;
+            }
+          } else if (params.embeddedTags?.lyrics) {
+            lyricsSummary = 'Lyrics: Aus eingebettetem Datei-Tag (ID3/MP4) übernommen';
           }
         }
       } catch {
-        mbSummary = 'MusicBrainz derzeit nicht erreichbar (Tags manuell bearbeitbar)';
-      }
-
-      let lyricsSummary = 'Lyrics: Keine passenden Treffer bei LRCLIB';
-      try {
-        const lrcParams = new URLSearchParams();
-        if (resolvedTitle) {
-          lrcParams.set('track_name', resolvedTitle);
-          if (resolvedArtist) lrcParams.set('artist_name', resolvedArtist);
-        } else {
-          lrcParams.set('q', [resolvedArtist, resolvedTitle].filter(Boolean).join(' '));
-        }
-
-        let lrcRes = await fetch(`/api/lyrics/search?${lrcParams.toString()}`);
-        let list: LrcLibResult[] = [];
-        if (lrcRes.ok) {
-          const lrcData = await lrcRes.json();
-          list = Array.isArray(lrcData.results) ? lrcData.results : [];
-        }
-
-        // Fallback broader search if strict track_name/artist_name missed
-        if (list.length === 0 && resolvedTitle) {
-          const fallbackParams = new URLSearchParams({
-            q: [resolvedArtist, resolvedTitle].filter(Boolean).join(' '),
-          });
-          lrcRes = await fetch(`/api/lyrics/search?${fallbackParams.toString()}`);
-          if (lrcRes.ok) {
-            const fbData = await lrcRes.json();
-            list = Array.isArray(fbData.results) ? fbData.results : [];
-          }
-        }
-
-        setLrcResults(list);
-        const bestLrc = pickBestLyricsResult(list, durationSec, resolvedTitle);
-        if (bestLrc) {
-          if (bestLrc.syncedLyrics) {
-            const parsed = parseLrcString(bestLrc.syncedLyrics);
-            const phrases = lrcLinesToPhrases(
-              parsed,
-              activeBpm,
-              DEFAULT_RESOLUTION,
-              activeOffsetMs,
-              durationSec || 180
-            );
-            setLyrics(phrases);
-            lyricsSummary = `Lyrics: ${phrases.length} synchronisierte Zeilen automatisch geladen`;
-          } else if (bestLrc.plainLyrics) {
-            const {plainTextToTimedPhrases} = await import('./utils/lyricsSync');
-            const phrases = plainTextToTimedPhrases(
-              bestLrc.plainLyrics,
-              durationSec || 180,
-              activeBpm,
-              DEFAULT_RESOLUTION,
-              activeOffsetMs
-            );
-            setLyrics(phrases);
-            lyricsSummary = `Lyrics: ${phrases.length} Textzeilen automatisch auf Song verteilt`;
-          }
-        }
-      } catch {
+        mbSummary = 'Audio-ID/MusicBrainz derzeit nicht erreichbar (Tags manuell bearbeitbar)';
         lyricsSummary = 'Lyrics-Abruf fehlgeschlagen (manuell im Tab Lyrics & Sync ladbar)';
       }
 
@@ -470,9 +527,9 @@ export default function App() {
         mbSummary,
         lyricsSummary,
       });
-      showNotice('Charts, MusicBrainz-Tags & Songtexte automatisch erstellt');
+      showNotice('Charts, Audio-ID, MusicBrainz-Tags & Songtexte automatisch erstellt');
     },
-    [showNotice]
+    [analysis?.onsets, configs, showNotice]
   );
 
   const handleFileSelected = useCallback(
@@ -483,6 +540,10 @@ export default function App() {
 
       try {
         const arrayBuf = await file.arrayBuffer();
+        // 1. Extract embedded binary ID3v2 / MP4 atoms (Title, Artist, Album, ISRC, MBID, Cover, Lyrics)
+        const embeddedTags = extractEmbeddedMediaTags(arrayBuf);
+        setEmbeddedTagsRefState(embeddedTags);
+
         const ctx = getAudioContext();
         const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
         const parsedMeta = parseFilenameMetadata(file.name);
@@ -494,38 +555,51 @@ export default function App() {
         const initialBpm: BpmMarker[] =
           dsp.bpmMarkers && dsp.bpmMarkers.length > 0 ? dsp.bpmMarkers : [{tick: 0, bpm: dsp.bpm}];
 
+        const seedTitle = embeddedTags.title || parsedMeta.title;
+        const seedArtist = sanitizeArtistForQuery(embeddedTags.artist) || parsedMeta.artist;
+
         runInitialChartGeneration(
           decoded,
           {
-            title: parsedMeta.title,
-            artist: parsedMeta.artist || 'Unbekannter Interpret',
-            album: 'Single',
-            year: '2026',
-            genre: 'Rock',
-            coverDataUrl: null,
-            coverMime: null,
-            mbid: null,
-            releaseMbid: null,
+            title: seedTitle,
+            artist: seedArtist || '',
+            album: embeddedTags.album || 'Single',
+            year: embeddedTags.year || '2026',
+            genre: embeddedTags.genre || 'Rock',
+            coverDataUrl: embeddedTags.coverDataUrl || null,
+            coverMime: embeddedTags.coverMime || null,
+            mbid: embeddedTags.mbid || null,
+            releaseMbid: embeddedTags.releaseMbid || null,
+            isrc: embeddedTags.isrc || null,
+            audioId: dsp.audioId || null,
           },
           file.name,
           file,
           vidUrl,
-          undefined,
+          embeddedTags.lyrics,
           dsp
         );
-        setLyrics([]);
+        if (!embeddedTags.lyrics) {
+          setLyrics([]);
+        }
         setMbResults([]);
         setLrcResults([]);
         setIsDecoding(false);
 
-        // Run automatic MusicBrainz tagging, Cover Art, and LRCLIB synced lyrics immediately
-        void runAutoEnrichPipeline(
-          parsedMeta.artist,
-          parsedMeta.title,
-          decoded.duration,
-          initialBpm,
-          dsp.offsetMs
-        );
+        // 2. Run automatic Audio-ID + MusicBrainz + Cover Art + Synced Lyrics resolution immediately
+        void runAutoEnrichPipeline({
+          artistInput: seedArtist,
+          titleInput: seedTitle,
+          rawFileName: file.name,
+          durationSec: decoded.duration,
+          activeDurationSec: dsp.activeDurationSec,
+          musicStartSec: dsp.musicStartSec,
+          audioId: dsp.audioId,
+          embeddedTags,
+          activeBpm: initialBpm,
+          activeOffsetMs: dsp.offsetMs,
+          onsets: dsp.onsets,
+        });
       } catch (err) {
         console.error('Audio decode error:', err);
         setDecodeError(
@@ -649,13 +723,18 @@ export default function App() {
   const handleUpdateBpm = useCallback(
     (newBpm: number) => {
       const nextMarkers: BpmMarker[] = [{tick: 0, bpm: newBpm}, ...bpmMarkers.slice(1)];
+      const nextOffset =
+        analysis && analysis.onsets.length > 0
+          ? recomputeOffsetMsForBpm(newBpm, analysis.onsets)
+          : offsetMs;
       setBpmMarkers(nextMarkers);
+      setOffsetMs(nextOffset);
       if (analysis) {
         const regenerated = generateAllCharts(
           analysis.onsets,
           configs,
           nextMarkers,
-          offsetMs,
+          nextOffset,
           analysis.durationSec,
           DEFAULT_RESOLUTION
         );
@@ -737,7 +816,6 @@ export default function App() {
       const safeArtist = (metadata.artist || 'Artist').replace(/[\\/:*?"<>|]/g, '_');
       const safeTitle = (metadata.title || 'Song').replace(/[\\/:*?"<>|]/g, '_');
       const folderName = `${safeArtist} - ${safeTitle}`;
-      const folder = zip.folder(folderName) || zip;
 
       const isOriginalMp3 = sourceFile && sourceFile.name.toLowerCase().endsWith('.mp3');
       const audioFilename = isOriginalMp3 ? 'song.mp3' : 'song.wav';
@@ -745,6 +823,7 @@ export default function App() {
       const chartText = serializeChartFile({
         metadata,
         bpmMarkers,
+        sections: analysis?.sections ?? [],
         lyrics,
         tracks,
         offsetMs,
@@ -758,23 +837,25 @@ export default function App() {
         Boolean(videoUrl && sourceFile)
       );
 
-      folder.file('notes.chart', chartText);
-      folder.file('song.ini', iniText);
+      // Place files directly at the root of the ZIP archive so extracting "${folderName}.zip"
+      // into a folder does NOT create a duplicate nested folder inside a folder.
+      zip.file('notes.chart', chartText);
+      zip.file('song.ini', iniText);
 
       if (isOriginalMp3 && sourceFile) {
-        folder.file('song.mp3', await sourceFile.arrayBuffer());
+        zip.file('song.mp3', await sourceFile.arrayBuffer());
       } else {
-        folder.file('song.wav', encodeAudioBufferToWav(audioBuffer));
+        zip.file('song.wav', encodeAudioBufferToWav(audioBuffer));
       }
 
       if (videoUrl && sourceFile && metadata.includeVideo) {
-        folder.file('video.mp4', await sourceFile.arrayBuffer());
+        zip.file('video.mp4', await sourceFile.arrayBuffer());
       }
 
       if (metadata.coverDataUrl && metadata.coverDataUrl.includes(',')) {
         const ext = metadata.coverMime?.includes('png') ? 'png' : 'jpg';
         const base64 = metadata.coverDataUrl.split(',')[1];
-        folder.file(`album.${ext}`, base64, {base64: true});
+        zip.file(`album.${ext}`, base64, {base64: true});
       }
 
       const zipBlob = await zip.generateAsync({type: 'blob'});
@@ -792,6 +873,7 @@ export default function App() {
     const chartText = serializeChartFile({
       metadata,
       bpmMarkers,
+      sections: analysis?.sections ?? [],
       lyrics,
       tracks,
       offsetMs,
@@ -888,13 +970,18 @@ export default function App() {
             autoPipeline={autoPipeline}
             onSetMbResults={setMbResults}
             onRunAutoPipeline={() =>
-              runAutoEnrichPipeline(
-                metadata.artist,
-                metadata.title,
-                audioBuffer?.duration ?? 0,
-                bpmMarkers,
-                offsetMs
-              )
+              runAutoEnrichPipeline({
+                artistInput: metadata.artist,
+                titleInput: metadata.title,
+                rawFileName: sourceFileName,
+                durationSec: audioBuffer?.duration ?? 0,
+                activeDurationSec: analysis?.activeDurationSec,
+                musicStartSec: analysis?.musicStartSec,
+                audioId: analysis?.audioId,
+                embeddedTags: embeddedTagsRefState,
+                activeBpm: bpmMarkers,
+                activeOffsetMs: offsetMs,
+              })
             }
             onFileSelected={handleFileSelected}
             onLoadDemoSong={handleLoadDemoSong}

@@ -39,7 +39,7 @@ function selectAndQuantizeOnsets(
   durationSec: number,
   resolution: number
 ): SelectedEvent[] {
-  const minStrength = Math.max(0.08, 1 - config.onsetSensitivity);
+  const minStrength = Math.max(0.08, (1 - config.onsetSensitivity) * 0.82);
   const minSpacingSec = config.minSpacingMs / 1000;
   const maxTick = Math.max(
     resolution * 4,
@@ -62,11 +62,12 @@ function selectAndQuantizeOnsets(
     let qTick = quantizeTick(rawTick, resolution, config.quantizeGrid);
     if (qTick > maxTick) continue;
 
-    // Beat-grid salience weighting: reward hits locked to quarter/eighth beats, filter weak off-grid stray transients
+    // Beat-grid salience weighting + anti-dead-air boost when no note has been placed for >0.85s
     const distToGrid = Math.abs(rawTick - qTick);
     const onBeat = qTick % resolution === 0;
     const onEighth = qTick % (resolution / 2) === 0;
-    const gridBoost = onBeat ? 0.10 : onEighth ? 0.05 : 0;
+    const gapBoost = dtSec >= 0.85 && (onBeat || onEighth) ? 0.14 : 0;
+    const gridBoost = (onBeat ? 0.11 : onEighth ? 0.06 : 0) + gapBoost;
     if (onset.strength + gridBoost < minStrength) continue;
     if (!onEighth && distToGrid > step * 0.34 && onset.strength < minStrength + 0.14) {
       continue;
@@ -318,12 +319,35 @@ function generateStarPowerFromEvents(
 
   const targetCount = Math.max(1, Math.min(8, Math.round((durationSec / 22) * (0.6 + density * 1.4))));
   const spanEvents = Math.max(4, Math.floor(events.length / (targetCount + 1)));
+  const phraseLen = Math.max(3, Math.round(4 + density * 4));
   const phrases: StarPowerPhrase[] = [];
 
   for (let i = 0; i < targetCount; i++) {
-    const startIdx = Math.min(events.length - 4, Math.floor((i + 0.5) * spanEvents));
-    const endIdx = Math.min(events.length - 1, startIdx + Math.max(3, Math.round(4 + density * 4)));
-    const startTick = events[startIdx].tick;
+    const bucketCenter = Math.min(events.length - phraseLen, Math.floor((i + 0.5) * spanEvents));
+    const searchStart = Math.max(0, bucketCenter - Math.floor(spanEvents * 0.25));
+    const searchEnd = Math.min(
+      events.length - phraseLen,
+      bucketCenter + Math.floor(spanEvents * 0.25)
+    );
+
+    // Pick the highest-energy starting note near a beat/measure boundary within this song region
+    let bestStartIdx = bucketCenter;
+    let bestScore = -Infinity;
+    for (let cand = searchStart; cand <= searchEnd; cand++) {
+      let eSum = 0;
+      for (let k = 0; k < phraseLen && cand + k < events.length; k++) {
+        eSum += events[cand + k].onset.strength;
+      }
+      const onBarBonus = events[cand].tick % (resolution * 4) === 0 ? 0.45 : events[cand].tick % resolution === 0 ? 0.2 : 0;
+      const total = eSum + onBarBonus;
+      if (total > bestScore) {
+        bestScore = total;
+        bestStartIdx = cand;
+      }
+    }
+
+    const endIdx = Math.min(events.length - 1, bestStartIdx + phraseLen);
+    const startTick = events[bestStartIdx].tick;
     const endTick = Math.max(startTick + resolution * 2, events[endIdx].tick + 48);
 
     const prev = phrases[phrases.length - 1];
@@ -459,7 +483,7 @@ export function generateFiveFretTrack(
 
   // Easy uses 3 frets (G,R,Y), Medium uses 4 (G,R,Y,B), Hard/Expert use all 5
   const maxLaneIndex =
-    config.maxChordSize === 1 && config.chordProbability === 0 && config.hopoThresholdMs === 0
+    config.minSpacingMs >= 270 || config.onsetSensitivity <= 0.48
       ? 2 // Easy: G, R, Y
       : config.tapRate === 0 && config.maxChordSize <= 2 && config.quantizeGrid <= 8
         ? 3 // Medium: G, R, Y, B

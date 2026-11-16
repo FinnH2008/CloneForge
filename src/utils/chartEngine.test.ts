@@ -6,7 +6,8 @@ import {
   scoreMusicBrainzRecording,
   scoreMusicBrainzRelease,
 } from './autoSelect';
-import {analyzeAudioSamples, generateDemoAudioSamples} from './audioDsp';
+import {analyzeAudioSamples, generateDemoAudioSamples, recomputeOffsetMsForBpm} from './audioDsp';
+import {computeAudioFingerprint, extractEmbeddedMediaTags} from './audioId';
 import {
   enforceNonOverlappingSustains,
   generateAllCharts,
@@ -22,6 +23,7 @@ import {
   DEFAULT_RESOLUTION,
   parseFilenameMetadata,
   quantizeTick,
+  sanitizeArtistForQuery,
   tickToTimeSec,
   timeSecToTick,
 } from './timing';
@@ -78,9 +80,20 @@ test('5-Fret and 6-Fret GHL generators scale across all difficulties and obey GH
   assert.ok(counts5[0] > 0 && counts5[3] >= counts5[0], `5-Fret scaling: ${counts5.join(',')}`);
   assert.ok(countsGhl[0] > 0 && countsGhl[3] >= countsGhl[0], `GHL scaling: ${countsGhl.join(',')}`);
 
-  // GHL Easy preset disables Black frets
-  const easyHasBlack = tracks.ghl.Easy.notes.some((n) => n.fret === 'B1' || n.fret === 'B2' || n.fret === 'B3');
-  assert.equal(easyHasBlack, false);
+  // Easy must be chill yet engaging (>= 38% of Expert note count, not empty/boring)
+  assert.ok(
+    counts5[0] >= Math.floor(counts5[3] * 0.38) && counts5[0] < counts5[3],
+    `5-Fret Easy (${counts5[0]}) should be chill yet active vs Expert (${counts5[3]})`
+  );
+  assert.ok(
+    countsGhl[0] >= Math.floor(countsGhl[3] * 0.38) && countsGhl[0] < countsGhl[3],
+    `GHL Easy (${countsGhl[0]}) should be chill yet active vs Expert (${countsGhl[3]})`
+  );
+
+  // GHL Easy stays predominantly on White frets with occasional chill Black accents
+  const easyWhiteCount = tracks.ghl.Easy.notes.filter((n) => n.fret.startsWith('W')).length;
+  const easyBlackCount = tracks.ghl.Easy.notes.filter((n) => n.fret.startsWith('B')).length;
+  assert.ok(easyWhiteCount > easyBlackCount, 'GHL Easy should predominantly use White frets');
 
   // GHL Expert uses both White and Black frets and never combines OPEN with fretted notes at same tick
   const expertGhl = tracks.ghl.Expert;
@@ -702,4 +715,124 @@ test('GHL fret generator distributes notes across all 3 columns and avoids W2 mo
     `Expected >= 14% of note ticks to feature simultaneous White+Black frets, got ${anyWbSimultaneousCount}/${byTick.size}`
   );
 });
+
+test('Audio-ID fingerprint, binary ID3v2 tag extractor, and messy filename parser work reliably', () => {
+  // 1. Test messy filenames (track numbers, downloader prefixes, single hyphen, placeholders)
+  const f1 = parseFilenameMetadata('01 - Motionless in White - Another Life (Official Video) [1080p].mp4');
+  assert.equal(f1.artist, 'Motionless in White');
+  assert.equal(f1.title, 'Another Life');
+
+  const f2 = parseFilenameMetadata('[y2mate.com] Motionless in White-Another Life (320kbps).mp3');
+  assert.equal(f2.artist, 'Motionless in White');
+  assert.equal(f2.title, 'Another Life');
+
+  assert.equal(sanitizeArtistForQuery('Unbekannter Interpret'), '');
+  assert.equal(sanitizeArtistForQuery('Motionless in White'), 'Motionless in White');
+
+  // 2. Construct a binary ID3v2.3 tag buffer with TIT2, TPE1, TALB, TSRC (ISRC), and UFID (MusicBrainz ID)
+  const makeId3Frame = (id: string, text: string) => {
+    const textBytes = Buffer.from(text, 'utf8');
+    const payload = Buffer.concat([Buffer.from([0x03]), textBytes]); // 0x03 = UTF-8
+    const header = Buffer.alloc(10);
+    header.write(id, 0, 4, 'ascii');
+    header.writeUInt32BE(payload.length, 4);
+    return Buffer.concat([header, payload]);
+  };
+
+  const frames = Buffer.concat([
+    makeId3Frame('TIT2', 'Another Life'),
+    makeId3Frame('TPE1', 'Motionless in White'),
+    makeId3Frame('TALB', 'Disguise'),
+    makeId3Frame('TYER', '2019'),
+    makeId3Frame('TSRC', 'NLA321900085'),
+  ]);
+
+  const id3Header = Buffer.alloc(10);
+  id3Header.write('ID3', 0, 3, 'ascii');
+  id3Header[3] = 3; // v2.3
+  const size = frames.length;
+  id3Header[6] = (size >> 21) & 0x7f;
+  id3Header[7] = (size >> 14) & 0x7f;
+  id3Header[8] = (size >> 7) & 0x7f;
+  id3Header[9] = size & 0x7f;
+
+  const fullTagBuf = Buffer.concat([id3Header, frames, Buffer.alloc(64)]);
+  const arrayBuffer = fullTagBuf.buffer.slice(
+    fullTagBuf.byteOffset,
+    fullTagBuf.byteOffset + fullTagBuf.byteLength
+  );
+
+  const extracted = extractEmbeddedMediaTags(arrayBuffer);
+  assert.equal(extracted.title, 'Another Life');
+  assert.equal(extracted.artist, 'Motionless in White');
+  assert.equal(extracted.album, 'Disguise');
+  assert.equal(extracted.year, '2019');
+  assert.equal(extracted.isrc, 'NLA321900085');
+
+  // 3. Test acoustic Audio-ID fingerprint & silent video intro detection
+  const sr = 22050;
+  const totalSec = 24;
+  const samples = new Float32Array(sr * totalSec);
+  const demo = generateDemoAudioSamples(sr, 18);
+  // Leave first 4 seconds silent (like a video intro), then 18s of music, then 2s silent outro
+  samples.set(demo, 4 * sr);
+
+  const fp = computeAudioFingerprint(samples, sr);
+  assert.ok(fp.audioId.startsWith('CF1-'), `Expected CF1- Audio-ID prefix, got ${fp.audioId}`);
+  assert.ok(
+    fp.musicStartSec >= 3.5 && fp.musicStartSec <= 4.5,
+    `Expected musicStartSec near 4.0s, got ${fp.musicStartSec}`
+  );
+  assert.ok(
+    fp.activeDurationSec >= 17 && fp.activeDurationSec <= 19,
+    `Expected activeDurationSec near 18s, got ${fp.activeDurationSec}`
+  );
+});
+
+test('DSP detects 200 BPM power-metal double-bass tracks without aliasing to 133.3 BPM and parses kebab-case slugs', () => {
+  const sr = 22050;
+  const durationSec = 24;
+  const samples = new Float32Array(sr * durationSec);
+  const bpm = 200;
+  const beatSec = 60 / bpm; // 0.30s per beat
+
+  for (let b = 0; ; b++) {
+    const tBeat = 0.42 + b * beatSec;
+    if (tBeat >= durationSec - 0.4) break;
+    const start = Math.floor(tBeat * sr);
+    const len = Math.floor(0.11 * sr);
+    for (let j = 0; j < len && start + j < samples.length; j++) {
+      const jt = j / sr;
+      const env = Math.exp(-jt * 28);
+      if (b % 2 === 0) {
+        samples[start + j] += Math.sin(2 * Math.PI * (65 + 75 * Math.exp(-jt * 35)) * jt) * env * 0.8;
+      } else {
+        const nVal = Math.sin((start + j) * 12.9898) * 43758.5453;
+        const white = (nVal - Math.floor(nVal)) * 2 - 1;
+        samples[start + j] += (Math.sin(2 * Math.PI * 240 * jt) * 0.45 + white * 0.55) * env * 0.7;
+      }
+    }
+  }
+
+  const analysis = analyzeAudioSamples(samples, sr, durationSec);
+  assert.ok(
+    Math.abs(analysis.bpm - 200) <= 1.0,
+    `Expected 200 BPM power-metal track to detect at ~200 BPM (not 133.3), got ${analysis.bpm}`
+  );
+
+  const recomputedOffset = recomputeOffsetMsForBpm(200, analysis.onsets);
+  assert.ok(recomputedOffset >= 0 && recomputedOffset <= 1200);
+
+  const slugParsed = parseFilenameMetadata(
+    'troopers-of-the-stars-official-video---extreme-power-metal---dragonforce.mp4'
+  );
+  assert.equal(slugParsed.artist.toLowerCase(), 'troopers of the stars');
+  assert.equal(slugParsed.title.toLowerCase(), 'dragonforce');
+  assert.equal(
+    cleanMediaTitle('troopers-of-the-stars-official-video---extreme-power-metal---dragonforce').toLowerCase(),
+    'troopers of the stars - extreme power metal - dragonforce'
+  );
+});
+
+
 

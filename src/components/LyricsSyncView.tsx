@@ -65,7 +65,9 @@ export const LyricsSyncView: React.FC<LyricsSyncViewProps> = ({
 
   const handleSearchLyrics = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const q = searchQuery.trim() || [metadata.artist, metadata.title].filter(Boolean).join(' ');
+    const cleanArtist =
+      metadata.artist && metadata.artist !== 'Unbekannter Interpret' ? metadata.artist.trim() : '';
+    const q = searchQuery.trim() || [cleanArtist, metadata.title].filter(Boolean).join(' ');
     if (!q) {
       setError('Bitte Songtitel oder Interpret eingeben.');
       return;
@@ -77,9 +79,12 @@ export const LyricsSyncView: React.FC<LyricsSyncViewProps> = ({
       const params = new URLSearchParams();
       if (!searchQuery.trim() && metadata.title) {
         params.set('track_name', metadata.title);
-        if (metadata.artist) params.set('artist_name', metadata.artist);
+        if (cleanArtist) params.set('artist_name', cleanArtist);
       } else {
         params.set('q', q);
+      }
+      if (durationSec > 0) {
+        params.set('durationSec', String(Math.round(durationSec)));
       }
 
       const res = await fetch(`/api/lyrics/search?${params.toString()}`);
