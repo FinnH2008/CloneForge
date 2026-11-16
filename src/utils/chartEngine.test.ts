@@ -611,15 +611,18 @@ test('dynamic tempo-drift tracker emits BPM markers when track shifts from 120 t
   );
 });
 
-test('attack-bloom ghost doubles within ~60ms do not produce stacked off-beat double notes', () => {
+test('attack-bloom and 100ms 1/16th vocal/chord swells do not produce stacked double notes', () => {
   const configs = createDefaultDifficultyConfigs();
-  const bpmMarkers = [{tick: 0, bpm: 150}]; // 1 beat = 0.4s, 1/16th = 0.1s (48 ticks)
+  const bpmMarkers = [{tick: 0, bpm: 150}]; // 1 beat = 0.4s (192 ticks), 1/16th = 0.1s (48 ticks)
 
-  // Real hit on beat 1 (0.40s) + weaker trailing bloom 55ms later (0.455s) + hit on beat 2 (0.80s)
+  // Beat 1 (0.40s -> tick 192) + 98ms chord/vocal swell landing on next 1/16th slot (0.498s -> tick 240)
+  // + Beat 2 (0.80s -> tick 384) + 55ms bloom (0.855s) + Beat 3 (1.20s -> tick 576)
   const onsets = [
-    {timeSec: 0.40, strength: 0.85, centroid: 0.48, lowEnergy: 0.4, midEnergy: 0.8, highEnergy: 0.4, sustainSec: 0},
-    {timeSec: 0.455, strength: 0.46, centroid: 0.49, lowEnergy: 0.35, midEnergy: 0.6, highEnergy: 0.35, sustainSec: 0},
-    {timeSec: 0.80, strength: 0.84, centroid: 0.50, lowEnergy: 0.4, midEnergy: 0.8, highEnergy: 0.4, sustainSec: 0},
+    {timeSec: 0.40, strength: 0.85, centroid: 0.48, lowEnergy: 0.4, midEnergy: 0.8, highEnergy: 0.4, sustainSec: 0.15},
+    {timeSec: 0.498, strength: 0.58, centroid: 0.50, lowEnergy: 0.35, midEnergy: 0.65, highEnergy: 0.35, sustainSec: 0.6},
+    {timeSec: 0.80, strength: 0.84, centroid: 0.62, lowEnergy: 0.4, midEnergy: 0.8, highEnergy: 0.4, sustainSec: 0},
+    {timeSec: 0.855, strength: 0.46, centroid: 0.63, lowEnergy: 0.35, midEnergy: 0.6, highEnergy: 0.35, sustainSec: 0},
+    {timeSec: 1.20, strength: 0.86, centroid: 0.30, lowEnergy: 0.5, midEnergy: 0.8, highEnergy: 0.3, sustainSec: 0},
   ];
 
   const trackGhl = generateGhlTrack(onsets, configs.ghl.Expert, bpmMarkers, 0, 5, DEFAULT_RESOLUTION);
@@ -627,7 +630,76 @@ test('attack-bloom ghost doubles within ~60ms do not produce stacked off-beat do
 
   assert.deepEqual(
     ticks,
-    [192, 384],
-    `Trailing attack bloom must not split into stacked 1/32nd off-beat note; got ticks ${ticks.join(',')}`
+    [192, 384, 576],
+    `Isolated 1/16th swell at 0.498s and 55ms bloom at 0.855s must be merged into beat hits; got ticks ${ticks.join(',')}`
   );
 });
+
+test('GHL fret generator distributes notes across all 3 columns and avoids W2 monotony', () => {
+  const samples = generateDemoAudioSamples(22050, 24);
+  const analysis = analyzeAudioSamples(samples, 22050, 24);
+  const configs = createDefaultDifficultyConfigs();
+  const ghlExpert = generateGhlTrack(
+    analysis.onsets,
+    configs.ghl.Expert,
+    analysis.bpmMarkers ?? [{tick: 0, bpm: analysis.bpm}],
+    analysis.offsetMs,
+    analysis.durationSec,
+    DEFAULT_RESOLUTION
+  );
+
+  const fretted = ghlExpert.notes.filter((n) => n.fret !== 'OPEN');
+  const col1 = fretted.filter((n) => n.fret === 'W1' || n.fret === 'B1').length;
+  const col2 = fretted.filter((n) => n.fret === 'W2' || n.fret === 'B2').length;
+  const col3 = fretted.filter((n) => n.fret === 'W3' || n.fret === 'B3').length;
+  const w2Only = fretted.filter((n) => n.fret === 'W2').length;
+
+  assert.ok(col1 > 0 && col2 > 0 && col3 > 0, `Expected all 3 GHL columns active: col1=${col1}, col2=${col2}, col3=${col3}`);
+  assert.ok(
+    w2Only < fretted.length * 0.45,
+    `W2 must not dominate >45% of fretted notes (got ${w2Only}/${fretted.length})`
+  );
+
+  // Group notes by tick to inspect simultaneous White+Black chords (Barre & Diagonal)
+  const byTick = new Map<number, string[]>();
+  for (const n of ghlExpert.notes) {
+    const arr = byTick.get(n.tick) || [];
+    arr.push(n.fret);
+    byTick.set(n.tick, arr);
+  }
+
+  let barreChordCount = 0; // Same-column White+Black next to each other (W1+B1, W2+B2, W3+B3)
+  let diagonalWbChordCount = 0; // Cross-column White+Black (e.g., W1+B2, B1+W2, W2+B3, B2+W3)
+  let anyWbSimultaneousCount = 0;
+
+  for (const frets of byTick.values()) {
+    const hasWhite = frets.some((f) => f.startsWith('W'));
+    const hasBlack = frets.some((f) => f.startsWith('B'));
+    if (hasWhite && hasBlack) {
+      anyWbSimultaneousCount++;
+      const hasBarrePair =
+        (frets.includes('W1') && frets.includes('B1')) ||
+        (frets.includes('W2') && frets.includes('B2')) ||
+        (frets.includes('W3') && frets.includes('B3'));
+      if (hasBarrePair) {
+        barreChordCount++;
+      } else {
+        diagonalWbChordCount++;
+      }
+    }
+  }
+
+  assert.ok(
+    barreChordCount >= 4,
+    `Expected >= 4 same-column White+Black Barre chords (W1+B1 / W2+B2 / W3+B3), got ${barreChordCount}`
+  );
+  assert.ok(
+    diagonalWbChordCount >= 2,
+    `Expected >= 2 cross-column Diagonal White+Black chords (e.g., W1+B2 / B2+W3), got ${diagonalWbChordCount}`
+  );
+  assert.ok(
+    anyWbSimultaneousCount >= Math.floor(byTick.size * 0.14),
+    `Expected >= 14% of note ticks to feature simultaneous White+Black frets, got ${anyWbSimultaneousCount}/${byTick.size}`
+  );
+});
+

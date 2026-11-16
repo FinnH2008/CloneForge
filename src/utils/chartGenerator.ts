@@ -68,7 +68,7 @@ function selectAndQuantizeOnsets(
     const onEighth = qTick % (resolution / 2) === 0;
     const gridBoost = onBeat ? 0.10 : onEighth ? 0.05 : 0;
     if (onset.strength + gridBoost < minStrength) continue;
-    if (!onEighth && distToGrid > step * 0.36 && onset.strength < minStrength + 0.13) {
+    if (!onEighth && distToGrid > step * 0.34 && onset.strength < minStrength + 0.14) {
       continue;
     }
 
@@ -76,29 +76,39 @@ function selectAndQuantizeOnsets(
     // never from a trailing same-pitch attack bloom ("keine doppelten Off-Beat-Noten")
     if (qTick <= lastTick) {
       const prevEvent = chosen[chosen.length - 1];
-      const inSustainedBurst = prevTimeGapSec <= 0.15 && dtSec <= 0.135;
+      const nextOnset = i + 1 < onsets.length ? onsets[i + 1] : null;
+      const inSustainedBurst =
+        (prevTimeGapSec <= 0.14 || (nextOnset !== null && nextOnset.timeSec - onset.timeSec <= 0.14)) &&
+        dtSec <= 0.13;
       const strongPitchShift =
         prevEvent !== undefined &&
-        Math.abs(onset.centroid - prevEvent.onset.centroid) >= 0.035 &&
-        onset.strength >= Math.max(minStrength + 0.08, 0.42);
+        Math.abs(onset.centroid - prevEvent.onset.centroid) >= 0.06 &&
+        onset.strength >= Math.max(minStrength + 0.12, 0.48);
       const allowBurstSubStep =
         config.quantizeGrid >= 16 &&
         config.onsetSensitivity >= 0.65 &&
-        dtSec <= 0.135 &&
-        (inSustainedBurst || strongPitchShift);
+        dtSec <= 0.13 &&
+        inSustainedBurst &&
+        strongPitchShift;
 
       if (allowBurstSubStep) {
         const fineTick = lastTick + subStep;
-        if (fineTick <= maxTick && Math.abs(rawTick - fineTick) <= subStep * 0.9) {
+        if (fineTick <= maxTick && Math.abs(rawTick - fineTick) <= subStep * 0.85) {
           qTick = fineTick;
         }
       } else if (
         prevEvent &&
         qTick === lastTick &&
-        onset.strength > prevEvent.onset.strength + 0.14
+        onset.strength > prevEvent.onset.strength + 0.12
       ) {
         // Keep the stronger transient at this grid slot without duplicating the note
-        chosen[chosen.length - 1] = {tick: qTick, onset};
+        chosen[chosen.length - 1] = {
+          tick: qTick,
+          onset: {
+            ...onset,
+            sustainSec: Math.max(onset.sustainSec, prevEvent.onset.sustainSec),
+          },
+        };
         lastTimeSec = onset.timeSec;
         continue;
       }
@@ -112,7 +122,62 @@ function selectAndQuantizeOnsets(
     lastTick = qTick;
   }
 
-  return chosen;
+  // Post-Quantization Metrical Shadow-Double & Pre-Beat Flam Filter:
+  // Eliminates isolated 1/16th (48-tick) double-notes caused by vocal/reverb/chord bloom after a beat
+  // while preserving 100% of genuine >=3-note 16th-note runs, gallops, and distinct-pitch pickups.
+  const sixteenthTicks = Math.round(resolution / 4); // 48 ticks
+  const eighthTicks = Math.round(resolution / 2); // 96 ticks
+  const filtered: SelectedEvent[] = [];
+
+  for (let i = 0; i < chosen.length; i++) {
+    const cur = chosen[i];
+    if (filtered.length === 0) {
+      filtered.push(cur);
+      continue;
+    }
+
+    const prev = filtered[filtered.length - 1];
+    const dtPrev = cur.tick - prev.tick;
+    const prevPrev = filtered.length >= 2 ? filtered[filtered.length - 2] : null;
+    const dtPrevPrev = prevPrev ? prev.tick - prevPrev.tick : resolution * 4;
+    const next = i + 1 < chosen.length ? chosen[i + 1] : null;
+    const dtNext = next ? next.tick - cur.tick : resolution * 4;
+
+    if (dtPrev <= sixteenthTicks) {
+      // Check if part of a >= 3-note rapid 16th-note stream or gallop
+      const inFastStream = dtPrevPrev <= sixteenthTicks * 1.35 || dtNext <= sixteenthTicks * 1.35;
+      if (!inFastStream) {
+        const pitchDiff = Math.abs(cur.onset.centroid - prev.onset.centroid);
+        const prevOnEighth = prev.tick % eighthTicks === 0;
+        const curOnEighth = cur.tick % eighthTicks === 0;
+
+        // Case A: prev is on a strong beat/eighth and cur is an isolated off-beat 1/16th bloom of similar pitch or weaker strength
+        if (prevOnEighth && !curOnEighth && (pitchDiff < 0.085 || cur.onset.strength < prev.onset.strength * 0.88)) {
+          prev.onset = {
+            ...prev.onset,
+            sustainSec: Math.max(prev.onset.sustainSec, cur.onset.sustainSec),
+          };
+          continue;
+        }
+
+        // Case B: prev was a weak off-beat 1/16th pre-flam immediately before a strong on-beat/eighth hit cur
+        if (!prevOnEighth && curOnEighth && (pitchDiff < 0.085 || cur.onset.strength >= prev.onset.strength * 0.95)) {
+          filtered[filtered.length - 1] = {
+            tick: cur.tick,
+            onset: {
+              ...cur.onset,
+              sustainSec: Math.max(cur.onset.sustainSec, prev.onset.sustainSec),
+            },
+          };
+          continue;
+        }
+      }
+    }
+
+    filtered.push(cur);
+  }
+
+  return filtered;
 }
 
 /**
@@ -136,11 +201,12 @@ function classifyPassages(events: SelectedEvent[], resolution: number): PassageK
     const dtPrevTicks = prev ? cur.tick - prev.tick : resolution * 2;
     const dtNextTicks = next ? next.tick - cur.tick : resolution * 2;
 
-    // Local 3-step IOI check for rapid passages
-    const inFastPair = dtPrevSec <= 0.185 && dtNextSec <= 0.21;
+    // Local 3-step IOI check for rapid passages (16th notes = 48 ticks, 12th triplets = 64 ticks; 8th notes = 96 ticks are groove)
+    const fastTickCutoff = Math.round(resolution * 0.36); // ~69 ticks
+    const inFastPair = dtPrevSec <= 0.155 && dtNextSec <= 0.165;
     const inFastTickRun =
-      dtNextTicks <= Math.round(resolution * 0.55) ||
-      (dtPrevTicks <= Math.round(resolution * 0.55) && dtNextTicks <= Math.round(resolution * 0.85));
+      dtNextTicks <= fastTickCutoff ||
+      (dtPrevTicks <= fastTickCutoff && dtNextTicks <= Math.round(resolution * 0.52));
 
     if (inFastPair || inFastTickRun) {
       kinds[i] = 'fast_run';
@@ -403,6 +469,7 @@ export function generateFiveFretTrack(
   let prevTimeSec = -10;
   let prevWasChord = false;
   let prevCentroid = 0.5;
+  let sameLaneStreak = 0;
 
   for (let i = 0; i < events.length; i++) {
     const ev = events[i];
@@ -447,10 +514,12 @@ export function generateFiveFretTrack(
       prevTimeSec = onset.timeSec;
       prevWasChord = false;
       prevCentroid = onset.centroid;
+      sameLaneStreak = 0;
       continue;
     }
 
     const dtMs = (onset.timeSec - prevTimeSec) * 1000;
+    const deltaC = onset.centroid - prevCentroid;
     let lane = prevLane;
 
     if (matchedTemplate) {
@@ -458,23 +527,27 @@ export function generateFiveFretTrack(
       lane = Math.min(maxLaneIndex, Math.max(0, matchedTemplate.lane));
     } else if (
       passage === 'fast_run' &&
-      Math.abs(onset.centroid - prevCentroid) < 0.06 &&
-      dtMs < 170
+      Math.abs(deltaC) < 0.045 &&
+      dtMs < 165
     ) {
       // Same-pitch fast tremolo picking stays anchored on one fret instead of wobbling
       lane = prevLane;
     } else {
-      const targetLane = Math.min(maxLaneIndex, Math.max(0, Math.round(onset.centroid * maxLaneIndex)));
+      const targetLane = Math.min(
+        maxLaneIndex,
+        Math.max(0, Math.floor(onset.centroid * (maxLaneIndex + 0.999)))
+      );
       if (targetLane > prevLane) {
         const stepJump = passage === 'fast_run' ? 1 : targetLane - prevLane > 2 ? 2 : 1;
         lane = Math.min(maxLaneIndex, prevLane + stepJump);
       } else if (targetLane < prevLane) {
         const stepJump = passage === 'fast_run' ? 1 : prevLane - targetLane > 2 ? 2 : 1;
         lane = Math.max(0, prevLane - stepJump);
-      } else if (passage === 'fast_run' && Math.abs(onset.centroid - prevCentroid) >= 0.08) {
-        // Inside fast melodic runs, prefer audible staircase motion if centroid clearly shifted
-        if (onset.centroid > prevCentroid && prevLane < maxLaneIndex) lane = prevLane + 1;
-        else if (onset.centroid < prevCentroid && prevLane > 0) lane = prevLane - 1;
+      } else if (Math.abs(deltaC) >= 0.055 || sameLaneStreak >= 2) {
+        if (deltaC >= 0 && prevLane < maxLaneIndex) lane = prevLane + 1;
+        else if (deltaC < 0 && prevLane > 0) lane = prevLane - 1;
+        else if (prevLane > 0) lane = prevLane - 1;
+        else lane = Math.min(maxLaneIndex, prevLane + 1);
       }
     }
 
@@ -532,6 +605,7 @@ export function generateFiveFretTrack(
       });
     }
 
+    sameLaneStreak = lane === prevLane ? sameLaneStreak + 1 : 0;
     prevLane = lane;
     prevTimeSec = onset.timeSec;
     prevWasChord = isChord;
@@ -577,15 +651,26 @@ export function generateGhlTrack(
   const passages = classifyPassages(events, resolution);
   const riffMatches = detectRiffMotifs(events);
 
+  type GhlChordVoicing = 'none' | 'barre' | 'diagonal' | 'adjacent_row' | 'power_3';
   const rawNotes: ChartNote[] = [];
-  const chosenPattern: {col: number; row: 'W' | 'B'; isOpen: boolean; isChord: boolean}[] =
-    new Array(events.length);
+  const chosenPattern: {
+    col: number;
+    row: 'W' | 'B';
+    isOpen: boolean;
+    chordVoicing: GhlChordVoicing;
+    partnerCol: number;
+  }[] = new Array(events.length);
 
   let prevCol = 0; // 0, 1, 2
   let prevRow: 'W' | 'B' = 'W';
   let prevTimeSec = -10;
   let prevWasChord = false;
+  let consecutiveChords = 0;
+  let prevVoicing: GhlChordVoicing = 'none';
   let prevCentroid = 0.5;
+  let prevHigh = 0.5;
+  let sameFretStreak = 0;
+  let sameRowStreak = 0;
 
   const canUseWhite = config.allowWhiteFrets || !config.allowBlackFrets;
   const canUseBlack = config.allowBlackFrets;
@@ -609,7 +694,7 @@ export function generateGhlTrack(
       riffRef !== undefined ? chosenPattern[riffRef.templateStart + riffRef.offset] : undefined;
 
     // GHL Open Strum on heavy low-end hits or pedal-tone chug riffs
-    const isHeavyBass = onset.lowEnergy > 0.7 && onset.centroid < 0.38;
+    const isHeavyBass = onset.lowEnergy > 0.72 && onset.centroid < 0.36;
     const isPedalAlternation =
       isHeavyBass &&
       i + 1 < events.length &&
@@ -621,7 +706,13 @@ export function generateGhlTrack(
         (isPedalAlternation || i % Math.max(2, Math.round(1 / config.openNoteRate)) === 0);
 
     if (useOpen) {
-      chosenPattern[i] = {col: prevCol, row: prevRow, isOpen: true, isChord: false};
+      chosenPattern[i] = {
+        col: prevCol,
+        row: prevRow,
+        isOpen: true,
+        chordVoicing: 'none',
+        partnerCol: prevCol,
+      };
       rawNotes.push({
         id: `ghl-${tick}-OPEN`,
         tick,
@@ -632,11 +723,17 @@ export function generateGhlTrack(
       });
       prevTimeSec = onset.timeSec;
       prevWasChord = false;
+      consecutiveChords = 0;
+      prevVoicing = 'none';
       prevCentroid = onset.centroid;
+      prevHigh = onset.highEnergy;
+      sameFretStreak = 0;
       continue;
     }
 
     const dtMs = (onset.timeSec - prevTimeSec) * 1000;
+    const deltaC = onset.centroid - prevCentroid;
+    const deltaH = onset.highEnergy - prevHigh;
     let col = prevCol;
     let row: 'W' | 'B' = prevRow;
 
@@ -653,28 +750,52 @@ export function generateGhlTrack(
             : 'B';
     } else if (
       passage === 'fast_run' &&
-      Math.abs(onset.centroid - prevCentroid) < 0.06 &&
-      dtMs < 170
+      Math.abs(deltaC) < 0.045 &&
+      dtMs < 165
     ) {
       // Same-pitch fast tremolo picking stays anchored on one GHL fret
       col = prevCol;
       row = prevRow;
     } else {
-      const targetCol = Math.min(2, Math.max(0, Math.round(onset.centroid * 2)));
-      if (targetCol > prevCol) col = Math.min(2, prevCol + 1);
-      else if (targetCol < prevCol) col = Math.max(0, prevCol - 1);
+      // Balanced tertile column mapping across the 3 GHL columns (index=0, middle=1, ring=2)
+      const targetCol = onset.centroid < 0.36 ? 0 : onset.centroid > 0.64 ? 2 : 1;
+      if (passage === 'fast_run' && Math.abs(targetCol - prevCol) > 1) {
+        col = targetCol > prevCol ? prevCol + 1 : prevCol - 1;
+      } else if (targetCol !== prevCol) {
+        col = targetCol;
+      } else if (Math.abs(deltaC) >= 0.055) {
+        col = deltaC > 0 ? Math.min(2, prevCol + 1) : Math.max(0, prevCol - 1);
+      }
 
       if (canUseWhite && canUseBlack) {
-        const wantBlack =
-          onset.highEnergy + onset.centroid * 0.38 > 0.50 + config.rowSwitchPenalty * 0.25;
-        const desiredRow: 'W' | 'B' = wantBlack ? 'B' : 'W';
+        const upperScore = onset.highEnergy * 0.56 + onset.centroid * 0.44;
+        const rowThreshold = 0.44 + config.rowSwitchPenalty * 0.18;
+        let desiredRow: 'W' | 'B' = upperScore > rowThreshold ? 'B' : 'W';
+
+        // Active White <-> Black rocking on same column or after staying in one row for >=3 notes
+        if (
+          desiredRow === prevRow &&
+          sameRowStreak >= Math.max(2, Math.round(2 + config.rowSwitchPenalty * 3)) &&
+          (Math.abs(deltaH) >= 0.04 || Math.abs(deltaC) >= 0.04)
+        ) {
+          desiredRow = prevRow === 'W' ? 'B' : 'W';
+        } else if (
+          col === prevCol &&
+          desiredRow === prevRow &&
+          dtMs >= 135 &&
+          (Math.abs(deltaH) >= 0.06 || Math.abs(deltaC) >= 0.035)
+        ) {
+          // Rock finger between White and Black in the same column (W1<->B1, W2<->B2, W3<->B3)
+          desiredRow = prevRow === 'W' ? 'B' : 'W';
+        }
+
         if (desiredRow !== prevRow) {
           const dtSec = onset.timeSec - prevTimeSec;
-          const strongRegisterShift = Math.abs(onset.centroid - prevCentroid) >= 0.14;
+          const strongRegisterShift = Math.abs(deltaC) >= 0.09 || Math.abs(deltaH) >= 0.09;
           if (
-            dtSec >= 0.11 + config.rowSwitchPenalty * 0.34 ||
-            (strongRegisterShift && dtSec >= 0.10) ||
-            onset.strength > 0.78
+            dtSec >= 0.09 + config.rowSwitchPenalty * 0.24 ||
+            (strongRegisterShift && dtSec >= 0.08) ||
+            onset.strength > 0.68
           ) {
             row = desiredRow;
           }
@@ -682,49 +803,117 @@ export function generateGhlTrack(
       } else {
         row = canUseBlack ? 'B' : 'W';
       }
-    }
 
-    const primaryFret: GhlFretId = row === 'B' ? GHL_BLACK_FRETS[col] : GHL_WHITE_FRETS[col];
-    const fretsForTick: GhlFretId[] = [primaryFret];
-
-    const wantChord = matchedTemplate
-      ? matchedTemplate.isChord && config.maxChordSize > 1
-      : passage !== 'fast_run' &&
-        config.maxChordSize > 1 &&
-        config.chordProbability > 0 &&
-        onset.strength > 0.66 - config.chordProbability * 0.45 &&
-        !prevWasChord;
-
-    if (wantChord) {
-      if (
-        config.allowBarreChords &&
-        canUseWhite &&
-        canUseBlack &&
-        (onset.lowEnergy > 0.52 || !config.allowDiagonalChords)
-      ) {
-        const barrePartner = row === 'B' ? GHL_WHITE_FRETS[col] : GHL_BLACK_FRETS[col];
-        fretsForTick.push(barrePartner);
-      } else if (config.allowDiagonalChords && canUseWhite && canUseBlack) {
-        const nextCol = col < 2 ? col + 1 : col - 1;
-        const oppRow = row === 'B' ? GHL_WHITE_FRETS : GHL_BLACK_FRETS;
-        fretsForTick.push(oppRow[nextCol]);
-      } else {
-        const adjCol = col < 2 ? col + 1 : col - 1;
-        const sameRow = row === 'B' ? GHL_BLACK_FRETS : GHL_WHITE_FRETS;
-        fretsForTick.push(sameRow[adjCol]);
-      }
-
-      if (config.maxChordSize >= 3 && onset.strength > 0.84 && canUseWhite && canUseBlack) {
-        const adjCol = col < 2 ? col + 1 : col - 1;
-        const extra = row === 'B' ? GHL_BLACK_FRETS[adjCol] : GHL_WHITE_FRETS[adjCol];
-        if (!fretsForTick.includes(extra)) {
-          fretsForTick.push(extra);
+      // Anti-monotony guard: prevent camping on the exact same fret when melody moves
+      if (col === prevCol && row === prevRow && (sameFretStreak >= 2 || Math.abs(deltaC) >= 0.04)) {
+        if (canUseWhite && canUseBlack && dtMs >= 130 && sameRowStreak >= 2) {
+          row = prevRow === 'W' ? 'B' : 'W';
+        } else if (deltaC > 0.02 && prevCol < 2) {
+          col = prevCol + 1;
+        } else if (deltaC < -0.02 && prevCol > 0) {
+          col = prevCol - 1;
+        } else {
+          col = prevCol === 1 ? (onset.centroid >= 0.5 ? 2 : 0) : 1;
         }
       }
     }
 
+    sameFretStreak = col === prevCol && row === prevRow ? sameFretStreak + 1 : 0;
+    sameRowStreak = row === prevRow ? sameRowStreak + 1 : 0;
+
+    const primaryFret: GhlFretId = row === 'B' ? GHL_BLACK_FRETS[col] : GHL_WHITE_FRETS[col];
+    const fretsForTick: GhlFretId[] = [primaryFret];
+
+    // Metrical & dynamic accent score for GHL chords (Barre W+B and Diagonal W+B)
+    const onQuarter = tick % resolution === 0;
+    const onEighth = tick % (resolution / 2) === 0;
+    const accentScore =
+      onset.strength * 0.56 +
+      onset.midEnergy * 0.24 +
+      onset.lowEnergy * 0.20 +
+      (onQuarter ? 0.12 : onEighth ? 0.05 : -0.06) +
+      (sustain > 0 ? 0.08 : 0);
+
+    const chordThreshold = 0.62 - config.chordProbability * 0.52;
+    const canChainChord =
+      !prevWasChord || (dtMs >= 210 && consecutiveChords < 2 && accentScore >= chordThreshold + 0.06);
+
+    const wantChord = matchedTemplate
+      ? matchedTemplate.chordVoicing !== 'none' && config.maxChordSize > 1
+      : passage !== 'fast_run' &&
+        config.maxChordSize > 1 &&
+        config.chordProbability > 0 &&
+        accentScore >= chordThreshold &&
+        canChainChord;
+
+    let chosenVoicing: GhlChordVoicing = 'none';
+    let partnerCol = col < 2 ? col + 1 : col - 1;
+
+    if (wantChord) {
+      if (col === 1) {
+        partnerCol = onset.centroid >= 0.52 ? 2 : 0;
+      }
+
+      if (matchedTemplate && matchedTemplate.chordVoicing !== 'none') {
+        chosenVoicing = matchedTemplate.chordVoicing;
+        partnerCol = matchedTemplate.partnerCol;
+      } else if (canUseWhite && canUseBlack) {
+        const wantPower3 =
+          config.maxChordSize >= 3 &&
+          config.allowBarreChords &&
+          accentScore >= 0.74 &&
+          !prevWasChord;
+
+        if (wantPower3) {
+          chosenVoicing = 'power_3';
+        } else if (config.allowBarreChords && config.allowDiagonalChords) {
+          // Alternate authentically between Same-Column Barre (W1+B1, W2+B2, W3+B3)
+          // and Adjacent-Column Diagonal White+Black (W1+B2, B1+W2, W2+B3, B2+W3)
+          if (prevVoicing === 'barre' && dtMs < 450) {
+            chosenVoicing = 'diagonal';
+          } else if (prevVoicing === 'diagonal' && dtMs < 450) {
+            chosenVoicing = 'barre';
+          } else if (onset.lowEnergy >= 0.46 || onQuarter) {
+            chosenVoicing = 'barre';
+          } else {
+            chosenVoicing = 'diagonal';
+          }
+        } else if (config.allowBarreChords) {
+          chosenVoicing = 'barre';
+        } else if (config.allowDiagonalChords) {
+          chosenVoicing = 'diagonal';
+        } else {
+          chosenVoicing = 'adjacent_row';
+        }
+      } else {
+        chosenVoicing = 'adjacent_row';
+      }
+
+      if (chosenVoicing === 'barre' && canUseWhite && canUseBlack) {
+        // Simultaneous White + Black in the exact same column (W1+B1, W2+B2, or W3+B3)
+        const barrePartner = row === 'B' ? GHL_WHITE_FRETS[col] : GHL_BLACK_FRETS[col];
+        fretsForTick.push(barrePartner);
+      } else if (chosenVoicing === 'diagonal' && canUseWhite && canUseBlack) {
+        // Simultaneous White + Black across adjacent columns (W1+B2, B1+W2, W2+B3, B2+W3)
+        const oppRowFrets = row === 'B' ? GHL_WHITE_FRETS : GHL_BLACK_FRETS;
+        fretsForTick.push(oppRowFrets[partnerCol]);
+      } else if (chosenVoicing === 'power_3' && canUseWhite && canUseBlack) {
+        // 3-fret GHL power shape: Barre (W_col + B_col) + adjacent fret
+        const barrePartner = row === 'B' ? GHL_WHITE_FRETS[col] : GHL_BLACK_FRETS[col];
+        fretsForTick.push(barrePartner);
+        const thirdFret =
+          onset.highEnergy >= 0.55 ? GHL_BLACK_FRETS[partnerCol] : GHL_WHITE_FRETS[partnerCol];
+        if (!fretsForTick.includes(thirdFret)) {
+          fretsForTick.push(thirdFret);
+        }
+      } else {
+        const sameRowFrets = row === 'B' ? GHL_BLACK_FRETS : GHL_WHITE_FRETS;
+        fretsForTick.push(sameRowFrets[partnerCol]);
+      }
+    }
+
     const isChord = fretsForTick.length > 1;
-    chosenPattern[i] = {col, row, isOpen: false, isChord};
+    chosenPattern[i] = {col, row, isOpen: false, chordVoicing: chosenVoicing, partnerCol};
 
     const changedFret = col !== prevCol || row !== prevRow;
     const isHopoCandidate =
@@ -750,7 +939,10 @@ export function generateGhlTrack(
     prevRow = row;
     prevTimeSec = onset.timeSec;
     prevWasChord = isChord;
+    consecutiveChords = isChord ? consecutiveChords + 1 : 0;
+    if (isChord) prevVoicing = chosenVoicing;
     prevCentroid = onset.centroid;
+    prevHigh = onset.highEnergy;
   }
 
   const notes = enforceNonOverlappingSustains(rawNotes, resolution);
